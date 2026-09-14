@@ -409,9 +409,22 @@ static const amaran_mqtt_dispatch_t g_dispatch = {
 
 static void on_wifi_ip(void)
 {
+    /* Called on every IP_EVENT_STA_GOT_IP, i.e. again after each Wi-Fi
+     * reconnect: esp_netif zeroes the address on disconnect, so even the same
+     * IP counts as new. Starting MQTT again would create a second esp-mqtt
+     * client with the same default client ID (ESP32_<mac>) while the first
+     * keeps running, and the broker would hand the session back and forth
+     * between the two ("session taken over"). esp-mqtt reconnects on its own
+     * and the HTTP server stays bound, so each service is started once; a
+     * start that failed is tried again at the next GOT_IP. */
+    static bool mqtt_started = false, http_started = false;
+    if (mqtt_started && http_started) {
+        ESP_LOGI(TAG, "wifi back; mqtt reconnects by itself, http keeps listening");
+        return;
+    }
     ESP_LOGI(TAG, "wifi up; starting mqtt + http");
-    amaran_mqtt_start(&g_dispatch);
-    amaran_http_start(&g_dispatch);
+    if (!mqtt_started) mqtt_started = amaran_mqtt_start(&g_dispatch) == 0;
+    if (!http_started) http_started = amaran_http_start(&g_dispatch) == 0;
 }
 
 static int send_telink_to(uint16_t dst, const uint8_t payload[10])
