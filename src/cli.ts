@@ -26,6 +26,8 @@ import * as path from "path";
 import { fileURLToPath } from "url";
 import { loadConfig, configExists } from "./config.js";
 import { SOCKET_PATH, PID_PATH } from "./daemon-paths.js";
+// Type-only: erased at runtime, so noble is still not loaded until needed.
+import type { MeshController } from "./mesh-controller.js";
 // MeshController and daemon are imported dynamically to avoid noble initialization
 // interfering with the socket event loop when using the daemon.
 
@@ -102,7 +104,7 @@ async function runDirect(cmd: string, cmdArgs: string[], light?: string): Promis
 }
 
 async function runCommandOnController(
-  ctrl: any,
+  ctrl: MeshController,
   cmd: string,
   cmdArgs: string[],
   lightKey?: string
@@ -275,7 +277,7 @@ async function main() {
 
   // Meta commands
   if (firstArg === "setup") {
-    const { default: setupMain } = await import("./setup.js");
+    await import("./setup.js");   // setup.ts runs itself on import; it has no default export
     return;
   }
 

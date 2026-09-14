@@ -22,6 +22,7 @@
     "mqtt:watch": "tsx scripts/mqtt-watch.ts",
     "esp32:capture": "tsx scripts/esp32-capture.ts",
     "esp32:probe": "tsx scripts/esp32-probe.ts",
+    "test:plugin": "node streamdeck/test-plugin.mjs",
     "build": "tsc"
   },
   "keywords": [
@@ -33,14 +34,23 @@
     "control"
   ],
   "author": "Wes Bos (https://wesbos.com/)",
+  "contributors": [
+    "Arne Brockmann"
+  ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/abrockmann/amaran-BLE-control-streamdeck.git"
+  },
   "type": "module",
   "dependencies": {
-    "@abandonware/noble": "^1.9.2-26",
-    "mqtt": "^5.15.1",
-    "serialport": "^12.0.0"
+    "@abandonware/noble": "^1.9.2-26"
+  },
+  "optionalDependencies": {
+    "mqtt": "^5.15.1"
   },
   "devDependencies": {
+    "@esbuild/darwin-arm64": "0.27.2",
     "@types/node": "^25.0.10",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3"

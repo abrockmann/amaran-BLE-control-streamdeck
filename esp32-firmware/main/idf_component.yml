@@ -1,0 +1,7 @@
+## Managed components. Versions are pinned exactly, so a build never silently
+## picks up a new release; bump them on purpose.
+dependencies:
+  idf: ">=5.3"
+  # mDNS: the bridge answers as <DEVICE_ID>.local (default amaran-esp32.local),
+  # so clients need no IP address.
+  espressif/mdns: "==1.11.3"

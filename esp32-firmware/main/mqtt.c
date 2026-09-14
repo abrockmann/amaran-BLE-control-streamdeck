@@ -15,6 +15,7 @@
 static const char *TAG = "amaran_mqtt";
 
 static esp_mqtt_client_handle_t s_client;
+static uint32_t s_connects = 0;   /* MQTT_EVENT_CONNECTED since boot */
 static bool s_connected;
 static const amaran_mqtt_dispatch_t *s_dispatch;
 
@@ -51,6 +52,20 @@ static fixture_state_t s_state[AMARAN_LIGHT_COUNT];
  * flush ~350ms after the last command. */
 static esp_timer_handle_t s_publish_timer;
 #define PUBLISH_DEBOUNCE_US 350000
+
+bool amaran_mqtt_state_get(int idx, amaran_state_t *out)
+{
+    if (!out || idx < 0 || idx >= (int)AMARAN_LIGHT_COUNT) return false;
+    const fixture_state_t *s = &s_state[idx];
+    out->on         = s->on;
+    out->brightness = s->brightness;
+    out->kelvin     = s->color_temp_k;
+    out->hue        = s->hue;
+    out->sat        = s->sat;
+    out->gm         = s->gm;
+    out->is_hs      = s->is_hs;
+    return true;
+}
 
 static void publish_state(int idx)
 {
@@ -316,6 +331,27 @@ static int idx_by_addr(uint16_t addr)
     return -1;
 }
 
+bool amaran_mqtt_onoff_get(uint16_t addr, bool *on)
+{
+    int i = idx_by_addr(addr);
+    if (i < 0 || !on) return false;
+    *on = s_state[i].on;
+    return true;
+}
+
+void amaran_mqtt_note_onoff(uint16_t addr, bool on)
+{
+    for (int i = 0; i < AMARAN_LIGHT_COUNT; i++) {
+        if (addr != AMARAN_GROUP_ALL && AMARAN_LIGHTS[i].address != addr) {
+            continue;
+        }
+        if (s_state[i].on != on) {
+            s_state[i].on = on;
+            schedule_publish(i);
+        }
+    }
+}
+
 void amaran_mqtt_report_state(uint16_t addr, bool on, bool is_hs,
                               int brightness, int cct_kelvin, int gm,
                               int hue, int sat)
@@ -380,6 +416,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(TAG, "MQTT connected");
         s_connected = true;
+        s_connects++;
         publish_discovery();
         for (int i = 0; i < AMARAN_LIGHT_COUNT; i++) {
             esp_mqtt_client_subscribe(s_client, s_topics[i].set_topic, 0);
@@ -424,6 +461,11 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
     }
 }
 
+/* Configs written before TLS existed don't define it; empty means plain mqtt://. */
+#ifndef MQTT_CA_CERT
+#define MQTT_CA_CERT ""
+#endif
+
 int amaran_mqtt_start(const amaran_mqtt_dispatch_t *dispatch)
 {
     s_dispatch = dispatch;
@@ -457,6 +499,16 @@ int amaran_mqtt_start(const amaran_mqtt_dispatch_t *dispatch)
     esp_mqtt_client_config_t cfg = {
         .broker.address.uri = MQTT_URI,
     };
+    /* MQTT over TLS (mqtts://, since 2026-09-14): the broker's certificate is
+     * checked against this CA, including the host or IP address in MQTT_URI.
+     * Without TLS the MQTT password travels in plain text on the network. The
+     * TLS buffers are allocated dynamically (sdkconfig.defaults) — with the
+     * defaults a firmware upload during a TLS session left 2.2 KB of heap. */
+    if (sizeof(MQTT_CA_CERT) > 1) {
+        cfg.broker.verification.certificate = MQTT_CA_CERT;
+    } else if (strncmp(MQTT_URI, "mqtts://", 8) == 0) {
+        ESP_LOGE(TAG, "MQTT_URI is mqtts:// but MQTT_CA_CERT is empty — the broker cannot be verified");
+    }
     if (strlen(MQTT_USERNAME) > 0) {
         cfg.credentials.username = MQTT_USERNAME;
         cfg.credentials.authentication.password = MQTT_PASSWORD;
@@ -468,6 +520,16 @@ int amaran_mqtt_start(const amaran_mqtt_dispatch_t *dispatch)
                                    mqtt_event_handler, NULL);
     esp_mqtt_client_start(s_client);
     return 0;
+}
+
+bool amaran_mqtt_tls(void)
+{
+    return strncmp(MQTT_URI, "mqtts://", 8) == 0;
+}
+
+uint32_t amaran_mqtt_connects(void)
+{
+    return s_connects;
 }
 
 bool amaran_mqtt_is_connected(void)

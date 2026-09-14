@@ -1,0 +1,31 @@
+{
+  "Name": "amaran-Leuchten",
+  "Description": "Helligkeit, Farbtemperatur und Ein/Aus der amaran-Leuchten — über die ESP32-Brücke im Netz oder den lokalen Mesh-Daemon, ohne amaran Desktop.",
+  "Category": "amaran-Leuchten",
+  "com.arnebrockmann.amaran.brightness": {
+    "Name": "Helligkeit",
+    "Tooltip": "Drehen: Helligkeit. Druck: an/aus.",
+    "Encoder": {
+      "TriggerDescription": {
+        "Rotate": "Helligkeit",
+        "Push": "An/Aus",
+        "Touch": "An/Aus"
+      }
+    }
+  },
+  "com.arnebrockmann.amaran.cct": {
+    "Name": "Farbtemperatur",
+    "Tooltip": "Drehen: Farbtemperatur. Druck: zurück auf 5600 K.",
+    "Encoder": {
+      "TriggerDescription": {
+        "Rotate": "Farbtemperatur",
+        "Push": "5600 K",
+        "Touch": "5600 K"
+      }
+    }
+  },
+  "com.arnebrockmann.amaran.power": {
+    "Name": "Ein/Aus",
+    "Tooltip": "Schaltet die Leuchte ein oder aus und zeigt ihren echten Zustand."
+  }
+}

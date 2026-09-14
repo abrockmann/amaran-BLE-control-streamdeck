@@ -26,4 +26,6 @@ idf_component_register(
         mqtt
         esp_http_server
         json
+        app_update
+        esp_app_format
 )

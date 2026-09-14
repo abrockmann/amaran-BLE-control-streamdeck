@@ -1,0 +1,31 @@
+{
+  "Name": "amaran lights",
+  "Description": "Brightness, color temperature and on/off for amaran lights — through the ESP32 bridge on your network or the local mesh daemon, without amaran Desktop.",
+  "Category": "amaran lights",
+  "com.arnebrockmann.amaran.brightness": {
+    "Name": "Brightness",
+    "Tooltip": "Turn: brightness. Press: on/off.",
+    "Encoder": {
+      "TriggerDescription": {
+        "Rotate": "Brightness",
+        "Push": "On/off",
+        "Touch": "On/off"
+      }
+    }
+  },
+  "com.arnebrockmann.amaran.cct": {
+    "Name": "Color temperature",
+    "Tooltip": "Turn: color temperature. Press: back to 5600 K.",
+    "Encoder": {
+      "TriggerDescription": {
+        "Rotate": "Color temperature",
+        "Push": "5600 K",
+        "Touch": "5600 K"
+      }
+    }
+  },
+  "com.arnebrockmann.amaran.power": {
+    "Name": "On/off",
+    "Tooltip": "Switches the light on or off and shows its real state."
+  }
+}

@@ -1,0 +1,94 @@
+{
+  "Name": "amaran lights",
+  "Version": "1.1.0.0",
+  "Author": "Arne Brockmann",
+  "URL": "https://github.com/abrockmann/amaran-BLE-control-streamdeck",
+  "Category": "amaran lights",
+  "CategoryIcon": "imgs/plugin",
+  "Icon": "imgs/plugin",
+  "Description": "Brightness, color temperature and on/off for amaran lights — through the ESP32 bridge on your network or the local mesh daemon, without amaran Desktop.",
+  "UUID": "com.arnebrockmann.amaran",
+  "SDKVersion": 2,
+  "Software": {
+    "MinimumVersion": "6.5"
+  },
+  "OS": [
+    {
+      "Platform": "mac",
+      "MinimumVersion": "12.0"
+    }
+  ],
+  "Nodejs": {
+    "Version": "20"
+  },
+  "CodePath": "bin/plugin.js",
+  "PropertyInspectorPath": "ui/settings.html",
+  "Actions": [
+    {
+      "Name": "Brightness",
+      "UUID": "com.arnebrockmann.amaran.brightness",
+      "Icon": "imgs/brightness",
+      "Tooltip": "Turn: brightness. Press: on/off.",
+      "Controllers": [
+        "Encoder"
+      ],
+      "Encoder": {
+        "layout": "$B1",
+        "TriggerDescription": {
+          "Rotate": "Brightness",
+          "Push": "On/off",
+          "Touch": "On/off"
+        }
+      },
+      "States": [
+        {
+          "Image": "imgs/brightness",
+          "TitleAlignment": "bottom"
+        }
+      ]
+    },
+    {
+      "Name": "Color temperature",
+      "UUID": "com.arnebrockmann.amaran.cct",
+      "Icon": "imgs/cct",
+      "Tooltip": "Turn: color temperature. Press: back to 5600 K.",
+      "Controllers": [
+        "Encoder"
+      ],
+      "Encoder": {
+        "layout": "$B1",
+        "TriggerDescription": {
+          "Rotate": "Color temperature",
+          "Push": "5600 K",
+          "Touch": "5600 K"
+        }
+      },
+      "States": [
+        {
+          "Image": "imgs/cct",
+          "TitleAlignment": "bottom"
+        }
+      ]
+    },
+    {
+      "Name": "On/off",
+      "UUID": "com.arnebrockmann.amaran.power",
+      "Icon": "imgs/verge-on",
+      "Tooltip": "Switches the light on or off and shows its real state.",
+      "Controllers": [
+        "Keypad"
+      ],
+      "States": [
+        {
+          "Image": "imgs/verge-off",
+          "TitleAlignment": "bottom"
+        },
+        {
+          "Image": "imgs/verge-on",
+          "TitleAlignment": "bottom"
+        }
+      ],
+      "SupportedInMultiActions": false
+    }
+  ]
+}

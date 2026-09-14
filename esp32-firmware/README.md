@@ -16,7 +16,92 @@ desktop and iPad apps keep working alongside it.
 
 > Status: working on real hardware (ESP-32S, 3× amaran fixtures) as of
 > 2026-05-28. One known limitation — external-app → HA state sync — is
-> documented under [Two-way sync](#two-way-sync-known-limitation).
+> documented under [Two-way sync](#two-way-sync).
+
+> **Added in this fork:** the sections from here down to "Hardware", the macOS
+> notes in "One-time setup", the endpoints `/toggle` and `/status` with the on/off
+> delivery check in "HTTP REST API", and the `OTA_TOKEN` row below. The firmware
+> itself and the rest of this document are by Wes Bos — see
+> [Credits](../README.md#credits).
+
+## Firmware updates over Wi-Fi (OTA, since 2026-09-12)
+
+Only the **first** install needs the USB cable; it writes the OTA partition table
+(`partitions.csv`: `ota_0` + `ota_1`, 1.94 MB each). After that:
+
+Once, before the first install over USB:
+
+```sh
+cd esp32-firmware
+openssl rand -hex 16    # the OTA token: put it into OTA_TOKEN in main/wifi_config.h
+. ~/esp/esp-idf/export.sh
+espsecure.py generate_signing_key --version 1 --scheme ecdsa256 secure_boot_signing_key.pem
+```
+
+Keep both in your password manager. Then, for every update:
+
+```sh
+cd esp32-firmware && . ~/esp/esp-idf/export.sh && idf.py build   # signs the image
+read -rs -p "OTA token: " TOKEN; echo                            # keeps it out of shell history
+curl -X POST -H "X-Amaran-Token: $TOKEN" --data-binary @build/amaran_esp32_mesh_control.bin \
+  http://amaran-esp32.local/ota
+```
+
+- **Two locks.** The token keeps strangers from starting an upload; the
+  signature decides what gets installed. The bridge only accepts images signed
+  with `secure_boot_signing_key.pem` (ECDSA, `CONFIG_SECURE_SIGNED_APPS_NO_SECURE_BOOT`
+  in `sdkconfig.defaults`); anything else is refused with `invalid image`, and
+  the running firmware stays. The key is gitignored — whoever has it can sign
+  firmware the bridge accepts. The bootloader is unchanged, so signing could be
+  switched on over OTA, and a USB flash still accepts any image: the way back if
+  token or key are lost.
+- **Until 2026-09-13 the token was derived** from the MQTT password (HMAC with a
+  fixed label) and images were not signed. A security audit showed the chain:
+  MQTT runs unencrypted, so whoever can intercept traffic on the network reads the
+  password at a reconnect, computes the token and installs any firmware. Now the
+  token is random and a stolen token alone is not enough.
+- **Rollback** (since 2026-09-13). A new image boots `pending_verify` and is marked
+  valid only after it has run a minute with the HTTP server up (`image_state` in
+  `/status`). If it crashes before, the bootloader starts the previous image.
+  Tested with a signed image that aborted 20 s after boot: the serial log showed
+  the crash, the bootloader loaded `0x20000` again, and `/status` reported
+  `rolled_back_from: "ota_1"` with the previous firmware's ELF hash. The rollback
+  logic lives in the bootloader, so switching it on took one USB flash
+  (`idf.py -p <port> flash` — the mesh provisioning in NVS stays).
+- `esp_ota_end` verifies the image **before** the boot partition switches; an
+  aborted upload never boots half an image. The device then starts from the other
+  partition (`ota_0` <-> `ota_1`).
+- First real OTA on 2026-09-12: 1,668,608 bytes in 16 s, restart from `0x210000`
+  (`ota_1`), `already provisioned from NVS`, MQTT reconnected.
+- **If the partition table itself changes, OTA cannot do it** — back to the cable.
+- **Aborts on 2026-09-13:** two of three uploads failed, one of them with
+  `OTA aborted after 932160 bytes`. The handler treated a pause in receiving (a
+  socket timeout — the Wi-Fi shares its antenna with the mesh) as an abort. Since
+  then it waits out up to five timeouts, like the ESP-IDF upload examples. An abort
+  does no harm: the running firmware stays active, and `curl` reports
+  `{"ok":false,"error":"recv"}`. Just upload again. The firmware with this fix went
+  on over the cable, because the old one didn't have it yet. After that six of eight
+  uploads went through (17–22 s, once 77 s on weak Wi-Fi). **Two failed after
+  76–77 s with `Connection reset by peer`, and the device restarted each time** —
+  with the old firmware, so no harm done; a second attempt went through each time.
+- **Cause found the same day: a stack overflow.** `GET /status` then reported
+  `reset_reason: "panic"`, and a trace kept in RTC memory (it survives software and
+  panic resets) showed where: stage `verifying` — the whole image received, crash
+  inside `esp_ota_end` — with only 616 bytes of stack left in the HTTP server task.
+  A successful upload on the old firmware had just 40 bytes to spare. The server
+  task now gets 8192 instead of 4096 bytes; three consecutive uploads went through
+  in 18–19 s with about 4100 bytes left. The trace stays in `/status` as `last_ota`
+  (`stage`, `bytes`, `stack_free_min`) for the next surprise.
+
+## State over HTTP
+
+Besides key, name, address and MAC, `GET /lights` now also returns `on`,
+`brightness`, `mode` and `kelvin` or `hue`/`sat`, plus each light's capabilities:
+`has_color`, `has_gm`, `cct_min` and `cct_max`. Careful when reading it: the
+firmware takes brightness and color from the status reply **only for a light that is
+on** (`amaran_mqtt_report_state`). After a bridge restart, a light that is off shows
+the defaults (100 %, 4700 K) there until it is switched on once. For "off", only
+`on` itself is reliable.
 
 ## Hardware
 
@@ -29,14 +114,34 @@ desktop and iPad apps keep working alongside it.
 
 ```sh
 # 1. Install ESP-IDF v5.3.x and source it into your shell.
+#    NOTE on macOS: install.sh fetches the compilers but NOT cmake/ninja —
+#    it expects them from the system. Without them idf.py stops with
+#    '"cmake" must be available on the PATH'. To add them without Homebrew:
+#        python3 $IDF_PATH/tools/idf_tools.py install cmake ninja
+#    Use exactly v5.3.2: the core patch in patches/ is tested against it
+#    (applied cleanly on 2026-09-11).
 . ~/esp/esp-idf/export.sh
 
 # 2. Generate esp32-firmware/main/mesh_config.h from the amaran Desktop DB.
 #    Pulls mesh keys, fixtures, and per-fixture capabilities (color / G-M /
 #    CCT range) from the app's bundled fixture_config.json. Run from the
 #    repo root (it's a TypeScript tool in the main project):
-npm install
+npm ci --omit=optional
 npm run gen-config         # options: -- --db <path> --relay-hub <MAC>
+
+# WARNING, learned the hard way: gen-config reads THIS machine's amaran Desktop
+# database — and that can be stale. On 2026-09-11 it listed node address 37 for
+# the Verge Max while the light had long been listening on 40; every command to
+# 37 vanished silently, with "ok" from the API. The value was read correctly and
+# was still wrong.
+#
+# So before building, check the generated addresses against a source that
+# demonstrably switches (a working lights.json from another machine). If
+# something differs: copy the database, fix it in the copy, and point the
+# generator at the copy with --db — the original stays untouched and the
+# generator does its normal job:
+#     sqlite3 copy.db "UPDATE fixtures SET node_address=40 WHERE node_address=37;"
+#     npm run gen-config -- --db copy.db
 
 cd esp32-firmware
 
@@ -50,11 +155,13 @@ $EDITOR main/wifi_config.h
 | Field | Notes |
 |---|---|
 | `WIFI_SSID` / `WIFI_PASSWORD` | Your 2.4 GHz network |
-| `MQTT_URI` | e.g. `mqtt://192.168.1.10:1883` (the broker's IP is more reliable than mDNS on ESP32) |
+| `MQTT_URI` | e.g. `mqtts://192.168.1.10:8883` with TLS, or `mqtt://192.168.1.10:1883` without (the broker's IP is more reliable than mDNS on ESP32) |
+| `MQTT_CA_CERT` | CA certificate for `mqtts://`, see [MQTT over TLS](#mqtt-over-tls); `""` = plain MQTT |
 | `MQTT_USERNAME` / `MQTT_PASSWORD` | Broker login, or `""` for anonymous |
 | `HA_DISCOVERY_PREFIX` | Leave `homeassistant` unless changed in HA |
 | `MQTT_TOPIC_PREFIX` | `amaran` → topics like `amaran/key_light/set` |
 | `DEVICE_ID` | Change if you run more than one of these nodes |
+| `OTA_TOKEN` | Token for firmware updates over Wi-Fi; `""` disables OTA (see top of this file) |
 
 `main/mesh_config.h` and `main/wifi_config.h` are **key-bearing and
 `.gitignore`'d — never commit them.**
@@ -97,9 +204,40 @@ Capabilities are detected per fixture from the amaran app config
 (`hsi_support`, `gm_support`, `product_cct_min/max`), so CCT-only
 fixtures don't show a dead color wheel or G/M slider.
 
+## MQTT over TLS
+
+> Added in this fork (2026-09-14).
+
+Without TLS the MQTT login travels in plain text through the network. With it, the
+bridge checks the broker's certificate against a CA you put into
+`main/wifi_config.h`, including the address in `MQTT_URI`.
+
+1. **A small CA and a broker certificate.** Use EC P-256 — an RSA certificate
+   costs the bridge noticeably more memory (numbers below). The broker certificate
+   must name the address the bridge uses, e.g. `IP:192.168.1.10`. Best generate the
+   broker's private key on the broker itself and only move the certificate request
+   and the signed certificate around.
+2. **Home Assistant's Mosquitto add-on** reads `/ssl/fullchain.pem` (broker
+   certificate followed by the CA certificate) and `/ssl/privkey.pem`, and then
+   opens 8883. Restart the add-on.
+3. **The bridge:** `MQTT_URI "mqtts://<broker IP>:8883"` and the CA certificate
+   in `MQTT_CA_CERT`, then build and update.
+4. **Close the plain ports** 1883 and 1884 in the add-on's network settings.
+   Home Assistant itself talks to the add-on internally and keeps working; other
+   MQTT devices on your network would need TLS too.
+
+**Memory** — measured with a test build that ran an extra TLS client next to the
+normal one. mbedTLS's default buffers left 2.2 KB of heap during a firmware upload;
+with dynamic buffers (`sdkconfig.defaults`) 31 KB, and in normal operation with
+TLS the bridge keeps about 73 KB free. With an RSA-2048 broker certificate the
+lowest value during an upload was 11 KB.
+
 ## HTTP REST API
 
-The ESP32's IP is in the boot log (`amaran_wifi: got ip ...`). A DHCP
+The bridge answers as **`<DEVICE_ID>.local`** — `amaran-esp32.local` with the
+default `DEVICE_ID` — so you don't need its IP address. (It also has an IPv6
+link-local address; without one, macOS waited 5 s for an IPv6 answer on every name
+lookup.) The IP is in the boot log too (`amaran_wifi: got ip ...`); a DHCP
 reservation on your router keeps it stable.
 
 ```sh
@@ -107,6 +245,7 @@ curl http://<esp32-ip>/lights                     # list fixtures (JSON)
 
 curl -X POST http://<esp32-ip>/lights/key_light/on
 curl -X POST http://<esp32-ip>/lights/key_light/off
+curl -X POST http://<esp32-ip>/lights/key_light/toggle  # bridge flips its known state
 curl -X POST http://<esp32-ip>/lights/all/off      # target: key, "all", addr, or 0xNNNN
 
 curl -X POST http://<esp32-ip>/lights/key_light/brightness \
@@ -119,6 +258,61 @@ curl -X POST http://<esp32-ip>/lights/key_light/hsi \
 curl -X POST http://<esp32-ip>/refresh             # nudge desktop/iPad apps to re-sync
 curl -X POST http://<esp32-ip>/lights/key_light/refresh
 ```
+
+**Who may call it** (since 2026-09-13, from a security audit): the `Host` header
+has to be an IP address, `<DEVICE_ID>` or `<DEVICE_ID>.local`, and write requests
+must not carry an `Origin` header. That blocks web pages: without it any page open
+in a browser on your network could switch the lights with a simple cross-site POST,
+and a DNS-rebinding page could also read `/status` and `/lights`. curl, scripts and
+the Stream Deck plugin send no `Origin`. If you reach the bridge under another
+name (for example a router's DNS name), use its IP address instead — or add the
+name in `host_allowed()` in `main/http.c`. Refused requests get `403`.
+
+`GET /status` judges the bridge's placement without a USB cable:
+
+```json
+{"uptime_s":82,"reset_reason":"software","firmware":"514dda6-dirty","elf_sha256":"8ee6ffdf7",
+ "partition":"ota_0","free_heap":88648,"min_free_heap":73500,"mqtt_connected":true,
+ "mqtt_connects":1,"last_ota":{"stage":"done","bytes":1711824,"stack_free_min":4128},
+ "wifi":{"rssi":-49,"channel":1,"bssid":"02:00:00:00:00:01","reconnects":0},
+ "onoff":{"confirmed_in_round":[0,0,0],"not_confirmed":0},
+ "fixtures":[{"key":"amaran_verge_max_1","asked":6,"heard":5,"heard_s_ago":10}, …]}
+```
+
+- `wifi.rssi` — signal to the access point. Measured 2026-09-13: −82 dBm gave
+  HTTP round trips of 0.15–5 s, −61 dBm a median of 173 ms.
+- `fixtures[].heard` / `asked` — share of status requests a fixture answered,
+  i.e. Bluetooth reach. Counters start at boot; the poll asks every ~12 s, so
+  `heard_s_ago` stays under ~13 s for a fixture in range. `heard` also counts
+  replies triggered by other apps.
+- `onoff` — in which round an on/off got confirmed. Many round-2/3 entries or
+  `not_confirmed` mean the fixture hears the bridge badly; note that "off" to a
+  lit Verge Max was the hard case.
+- `image_state` / `rolled_back_from` — `pending_verify` for the first minute after
+  an update, then `valid` (`untracked` after a USB flash); `rolled_back_from` names
+  the partition the bootloader gave up on.
+- `largest_free_block` — the largest single allocation that would fit. TLS needs
+  contiguous memory, so this matters more than `free_heap` alone.
+- `wifi.reconnects` / `mqtt_connects` — Wi-Fi reconnects since boot and MQTT
+  connects since boot. `mqtt_connects` should stay near `wifi.reconnects + 1`; if
+  it keeps climbing on its own, the broker keeps dropping the bridge. Until
+  2026-09-13 every Wi-Fi reconnect started a second MQTT client with the same
+  client ID, and the two would have taken the session from each other in turn.
+- `elf_sha256` matches `shasum -a 256 build/amaran_esp32_mesh_control.elf` —
+  the way to confirm an OTA actually took.
+- `last_ota` — how far the last upload got (`begin`, `receiving`, `verifying`,
+  `done`, `failed`) and the least free stack of the HTTP task while it ran. Present
+  after a software or panic restart, not after power loss. `reset_reason: "panic"`
+  with `stage: "verifying"` is what the stack overflow looked like.
+
+`on`, `off` and `toggle` answer with the resulting state, e.g.
+`{"ok":true,"on":false}`; `toggle` needs a single fixture (400 for `all`). For a
+single fixture, on/off is repeated until its status reply shows the wanted
+state: per round three sends at 0/200/400 ms, a status request at 600 ms, a
+verdict at 1 s, at most three rounds. The Telink protocol has no ack, and "off"
+to a lit Verge Max was often lost without it (measurements in `HARDENING.md`).
+The HTTP answer comes right away and does not wait for that confirmation; the
+serial log shows `confirmed after … ms, round n` or `not confirmed after 3 rounds`.
 
 ## UART REPL
 

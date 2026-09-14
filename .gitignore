@@ -3,6 +3,38 @@ dist/
 
 # User-specific light config — generate with: npm run setup
 lights.json
+# ...and EVERY copy of it. The line above is an exact name; a backup such as
+# `lights.json.bak-<stamp>` does not match it but holds the same mesh keys. On
+# 2026-09-11 two such files lay untracked in the tree, one `git add -A` away
+# from a commit.
+lights.json.bak*
+lights.json.*.bak
+# The security audit of 2026-09-13 found more copies that were NOT covered:
+# lights.json.old, lights-backup.json, mesh_config.h.bak, wifi_config.h~, a root
+# mesh_config.h (gen-config --out), sdkconfig.bak, database copies. Hence broad
+# patterns with explicit exceptions for the templates.
+lights*.json*
+!lights.example.json
+**/mesh_config.h*
+**/wifi_config.h*
+!**/wifi_config.h.example
+**/sdkconfig
+**/sdkconfig.*
+!**/sdkconfig.defaults
+*.db
+*.db-*
+*.sqlite
+# Firmware signing key (esp32-firmware/secure_boot_signing_key.pem) and any other
+# private key: whoever has it can sign firmware the bridge accepts over OTA.
+*.pem
+# Home MQTT CA (esp32-firmware/mqtt-ca/): the CA key signs broker certificates
+# the bridge trusts. Certificates and requests are public, but installation-
+# specific — none of it belongs in the repo.
+*.key
+*.crt
+*.csr
+*.srl
+esp32-firmware/mqtt-ca/
 
 # Telink SDK state (recreated on each run)
 ~/Documents/TelinkSDKMeshJsonData
@@ -13,3 +45,10 @@ lights.json
 # vendor/PyMeshSDK/PyMeshSDK.so
 *.xapk
 amaran/
+
+# Python bytecode, e.g. from syntax-checking make-icons.py
+__pycache__/
+*.pyc
+
+# macOS Finder metadata
+.DS_Store

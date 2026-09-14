@@ -44,3 +44,34 @@ CONFIG_HTTPD_MAX_URI_LEN=512
 
 # Logging.
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# Signed firmware updates (security audit, 2026-09-13): the running firmware only
+# accepts OTA images signed with the private key in secure_boot_signing_key.pem
+# (gitignored; generate it once, see README). ECDSA (V1) is the scheme the classic
+# ESP32 supports without hardware secure boot. The bootloader stays as it is, so
+# this can be switched on over OTA; a USB flash still accepts any image, which is
+# also the way back if the key is lost.
+CONFIG_SECURE_SIGNED_APPS_NO_SECURE_BOOT=y
+CONFIG_SECURE_SIGNED_APPS_ECDSA_SCHEME=y
+CONFIG_SECURE_SIGNED_ON_UPDATE_NO_SECURE_BOOT=y
+# CONFIG_SECURE_SIGNED_ON_BOOT_NO_SECURE_BOOT is not set
+CONFIG_SECURE_BOOT_BUILD_SIGNED_BINARIES=y
+CONFIG_SECURE_BOOT_SIGNING_KEY="secure_boot_signing_key.pem"
+
+# OTA rollback (2026-09-13): a new image boots "pending verify" and is only marked
+# valid once it has run a minute with HTTP up (main.c, confirm_image_cb). A crash
+# before that makes the bootloader start the previous image. Lives in the
+# bootloader, so switching it on needed one USB flash.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# TLS memory (measured 2026-09-13 with a test build that ran an extra MQTT-over-TLS
+# client next to the normal plain one, P-256 server certificate):
+#   default buffers: 36 KB free with TLS, 18.5 KB lowest after the handshake,
+#                    2.2 KB lowest during a firmware upload — close to a crash.
+#   dynamic buffers: 59 KB free, 39.5 KB lowest after the handshake, 31 KB
+#                    lowest during an upload. (RSA-2048 server certificate: 27 KB
+#                    and 11 KB — use an EC certificate for the broker.)
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
+CONFIG_MBEDTLS_DYNAMIC_FREE_CA_CERT=y
+# CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE is not set

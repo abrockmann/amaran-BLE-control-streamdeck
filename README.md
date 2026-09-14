@@ -1,5 +1,11 @@
 # Amaran Light Controller
 
+> **Built on [wesbos/amaran-BLE-control](https://github.com/wesbos/amaran-BLE-control)
+> by Wes Bos (MIT).** This fork adds a Stream Deck plugin, reliability and latency
+> work on the ESP32 bridge, and hardening of the Mac daemon. The fork's operating
+> notes and measurements are in [HARDENING.md](HARDENING.md). What comes from whom
+> is listed under [Credits](#credits).
+
 Wifi + Direct Bluetooth Mesh control of Amaran studio lights — **no Amaran Desktop app required**.
 
 Two ways to drive the lights:
@@ -9,10 +15,85 @@ Two ways to drive the lights:
   always-on hardware bridge that joins the mesh and exposes the lights to
   **Home Assistant (MQTT)** and an **HTTP API**, no Mac required at runtime.
 
+## Stream Deck + ESP32 bridge (this fork)
+
+What this fork is built around: an ESP32 joins the lights' mesh and stays on, and
+a Stream Deck controls the lights over your network — brightness and color
+temperature on the dials, on/off on a key, always showing the lights' real state.
+No Mac has to hold a Bluetooth connection, and several computers can share the
+bridge.
+
+**You need**
+
+- amaran lights set up in the amaran app, and **amaran Desktop on a Mac** that
+  shows them: the config generator reads the mesh keys and light addresses from
+  its database. After setup, neither app has to run.
+- An ESP32 board (ESP-32S / WROOM-32, 4 MB flash) and a USB data cable.
+- A 2.4 GHz Wi-Fi network. The Stream Deck only talks to the bridge's HTTP API;
+  an MQTT broker is needed only for Home Assistant.
+- Stream Deck 6.5 or later on macOS 12 or later. Brightness and color temperature
+  need a model with dials (Stream Deck +); the on/off key works on any model.
+
+**Steps**
+
+1. Build and flash the bridge — short version under
+   [Flashing the ESP32](#flashing-the-esp32), details in
+   [`esp32-firmware/README.md`](esp32-firmware/README.md#one-time-setup). Check the
+   generated light addresses before you build; the warning there explains why.
+2. Check that it is up: `curl http://amaran-esp32.local/lights` lists your lights.
+3. Install the plugin: `streamdeck/pack-plugin.sh` builds
+   `streamdeck/dist/com.arnebrockmann.amaran.streamDeckPlugin` — double-click it.
+   Or run `streamdeck/install-plugin.sh`, which copies the plugin directly and
+   restarts Stream Deck.
+4. In Stream Deck, drag **Brightness** or **Color temperature** onto a dial and
+   **On/off** onto a key (category *amaran lights*). In the action's settings,
+   leave **Bridge** empty for `amaran-esp32.local` (or enter its IP address) and
+   pick the **Light**. Each action can control a different light.
+
+Prefer to have an AI assistant walk you through it? [SETUP-PROMPT.md](SETUP-PROMPT.md)
+is a prompt for Claude, ChatGPT or a coding agent, with rules that keep your
+Wi-Fi password and mesh keys out of the chat. It covers both ways, with and
+without an ESP32.
+
+## Stream Deck without an ESP32 (Mac only)
+
+No extra hardware: a daemon on your Mac holds the Bluetooth connection to the
+lights instead of amaran Desktop, and the plugin talks to it on `127.0.0.1:2708`.
+
+**Compared with the bridge**
+
+- **No real state.** The lights report their state only to the app that set them
+  up, so the plugin shows what it last sent. If a light is switched some other
+  way, the display is off until the next command from the Stream Deck.
+- **One mesh client at a time:** not alongside amaran Desktop, and not from two
+  Macs — a light accepts one Bluetooth connection.
+- **The Mac has to be awake and in Bluetooth range.** After sleep the daemon is
+  replaced automatically, which takes about 12 s.
+
+**Steps** — amaran Desktop with your lights on this Mac is needed once, as above.
+
+1. Install: `npm ci --omit=optional`, then
+   `npm rebuild @abandonware/noble --ignore-scripts=false` (why both:
+   [Quick Start](#quick-start)).
+2. `npm run setup` reads amaran Desktop's database and writes `lights.json`. It
+   holds the mesh keys — never commit or share it. Then quit amaran Desktop.
+3. `streamdeck/build-apps.sh` builds `~/Applications/amaran-daemon.app`, and
+   `streamdeck/install-daemon-agent.sh` starts it now, at login and after sleep.
+   On the first start macOS asks for Bluetooth access — allow it.
+4. Check: `curl http://127.0.0.1:2708/lights` lists your lights.
+5. `AMARAN_HOST=127.0.0.1 streamdeck/install-plugin.sh` — use this rather than the
+   double-click package, which doesn't know where the daemon's guard lives.
+6. In Stream Deck, add the actions as above; the **Light** list in their settings
+   shows the daemon's lights.
+
+Background and measurements: [HARDENING.md](HARDENING.md#operation-local-mac-daemon)
+and its [limits](HARDENING.md#limits).
+
 ## Quick Start
 
 ```bash
-npm install
+npm ci --omit=optional                                  # lockfile install, no vulnerable build-only chain
+npm rebuild @abandonware/noble --ignore-scripts=false   # builds the BLE addon
 npm run setup        # reads your amaran.db and writes lights.json (one time)
 
 # Slow path (~10s startup per command, no daemon needed):
@@ -26,6 +107,13 @@ npm run mesh:brightness 75
 npm run mesh:off
 npm run daemon:stop
 ```
+
+Why two install steps: `--omit=optional` keeps out a build-only dependency chain
+with known vulnerabilities, and `npm rebuild` compiles the Bluetooth addon even
+where npm's `ignore-scripts` is set (without it the daemon dies with *No native
+build was found*). `--omit=optional` would also drop esbuild's platform binary,
+which is why `package.json` lists `@esbuild/darwin-arm64` directly — on an Intel
+Mac, change it to `@esbuild/darwin-x64`. Details: [HARDENING.md](HARDENING.md#installation).
 
 ## Setup
 
@@ -183,13 +271,19 @@ Configure port and optional API key in `lights.json`:
 
 ```json
 {
-  "http": { "port": 2708, "host": "0.0.0.0", "apiKey": "my-secret" }
+  "http": { "port": 2708, "host": "0.0.0.0", "apiKey": "<output of: openssl rand -hex 32>" }
 }
 ```
 
+Without `apiKey` the daemon only listens on `127.0.0.1`. The key travels in plain
+HTTP, so anyone who can watch your network traffic can read it — use a long random
+key, and a different one from any other password.
+
 ## Home Assistant Integration
 
-Via MQTT discovery:
+Via MQTT discovery. The Mac daemon needs the optional `mqtt` package for this —
+install with plain `npm ci` instead of `npm ci --omit=optional`. (The ESP32
+bridge below has MQTT built in and needs nothing from npm.)
 
 1. Install Mosquitto on the HA host (Add-on store)
 2. Add to `lights.json`:
@@ -231,7 +325,7 @@ git apply /path/to/amaran-light/esp32-firmware/patches/0001-amaran-net-recv-stat
 
 # 3. Generate the mesh config from the amaran Desktop DB (run from repo root).
 cd /path/to/amaran-light
-npm install
+npm ci --omit=optional
 npm run gen-config
 
 # 4. Fill in Wi-Fi + MQTT credentials.
@@ -246,3 +340,16 @@ idf.py -p /dev/cu.SLAB_USBtoUART flash monitor
 
 `main/mesh_config.h` and `main/wifi_config.h` are **key-bearing and
 `.gitignore`'d — never commit them.**
+
+## Credits
+
+| Part | Author |
+| --- | --- |
+| Mac BLE mesh client (`src/`), config generator and ESP32 helper scripts (`scripts/generate-config.ts`, `scripts/esp32-*.ts`, `scripts/mqtt-watch.ts`), ESP32 mesh node firmware (`esp32-firmware/`: self-provisioning, BLE Mesh core patch, MQTT with Home Assistant discovery, HTTP API), `DIRECT-BLE-CONTROL.md` | **Wes Bos** — [wesbos/amaran-BLE-control](https://github.com/wesbos/amaran-BLE-control) |
+| Reverse-engineered Telink `0x26` packet formats and the status-request refresh trick, reused by the ESP32 firmware | **Aaron's macOS amaran project**, as credited by Wes Bos in [esp32-firmware/README.md](esp32-firmware/README.md#relationship-to-aarons-amaran-cli) |
+| MIT license file of the original project | **Kevin Schaich** (upstream commit `4658c64`) |
+| ESP-IDF, whose BLE Mesh stack the core patch modifies | **Espressif Systems** (Apache-2.0) |
+| Stream Deck plugin with its settings page, icons, test and scripts (`streamdeck/`), frame tools (`scripts/frame-*.ts`), `SETUP-PROMPT.md`; ESP32 changes: on/off delivery check, `/toggle`, `/status`, state and capabilities in `GET /lights`, the name `amaran-esp32.local` (mDNS), strongest access point selection, firmware updates over Wi-Fi (OTA); Mac daemon hardening and proxy selection by signal strength; `HARDENING.md` | **Arne Brockmann** (this fork) |
+
+amaran, Aputure and Sidus Link are trademarks of their respective owners. This
+project is not affiliated with or endorsed by them.

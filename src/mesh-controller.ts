@@ -63,7 +63,7 @@ function aesCmac(key: Buffer, message: Buffer): Buffer {
   const n = Math.ceil(message.length / 16) || 1;
   const lastComplete = message.length > 0 && message.length % 16 === 0;
 
-  let x = Buffer.alloc(16, 0);
+  let x: Buffer = Buffer.alloc(16, 0);   // widened: aesEcbBlock returns Buffer<ArrayBufferLike>
 
   for (let i = 0; i < n - 1; i++) {
     const block = message.subarray(i * 16, i * 16 + 16);
@@ -203,7 +203,7 @@ function proxyNonce(seq: number, src: number, ivIndex: number): Buffer {
 
 // Build the full proxy PDU for a mesh access message
 // Returns the bytes to write to PROXY_DATA_IN
-function buildProxyPDU(
+export function buildProxyPDU(
   appKey: Buffer,
   aid: number,
   nid: number,
@@ -367,7 +367,15 @@ export class MeshController {
       const knownMacs = self.lights.map(l => l.mac.toLowerCase().replace(/-/g, ":"));
       console.log(`Scanning for lights (relay hub MAC: ${hubMac})...`);
       let found = false;
-      const candidates = new Map<string, any>(); // normalized-addr → peripheral
+      // Candidates with their signal strength: the choice depends on that, not
+      // on the order in which they show up.
+      const candidates = new Map<string, { p: any; rssi: number; proxy: boolean; label: string }>();
+      // Anything weaker than this is no use as a proxy host. On 2026-09-11 the
+      // daemon grabbed a FOREIGN mesh device at -94 dBm while our own light sat
+      // right there at -42 dBm; every command from then on silently went into a
+      // foreign network — with "ok" from the API, because the protocol has no
+      // acknowledgement.
+      const MIN_RSSI = Number(process.env.AMARAN_MIN_RSSI ?? -85);
 
       noble.on("stateChange", async (state: string) => {
         if (state === "poweredOn") await noble.startScanningAsync([], true);
@@ -387,16 +395,28 @@ export class MeshController {
 
         const isHub = addr === hubMac;
         const matchType = hasMeshProxy ? "proxy-svc" : isByMac ? "mac" : "name";
+        const label = p.advertisement.localName || addr;
         if (!candidates.has(addr)) {
-          console.log(`  Found: ${p.advertisement.localName || addr} (${addr}) [${matchType}]${isHub ? " ← relay hub" : ""}`);
+          console.log(`  Found: ${label} (${addr}) [${matchType}] ${p.rssi} dBm${isHub ? " ← relay hub" : ""}`);
         }
-        candidates.set(addr, p);
+        // Advertisements alternate: the same device sometimes shows the proxy
+        // service, sometimes only its name. So once seen means remembered.
+        const prev = candidates.get(addr);
+        candidates.set(addr, {
+          p,
+          rssi: typeof p.rssi === "number" ? p.rssi : (prev?.rssi ?? -127),
+          proxy: hasMeshProxy || (prev?.proxy ?? false),
+          label,
+        });
 
         if (isHub) {
           found = true;
+          clearInterval(decider);
           noble.stopScanningAsync();
           doConnect(p, addr).then(resolve);
+          return;
         }
+        tryDecide();
       });
 
       // After 5s, pick best candidate.
@@ -408,34 +428,71 @@ export class MeshController {
         "b3ed1263a9304e5132b3edfbb4c71aec", // Key Light
         "d16927ee947b5a0ced73358c29bc4bcd", // Back Light
       ];
-      const hubWait = setTimeout(async () => {
-        if (found || candidates.size === 0) return;
-        found = true;
-        await noble.stopScanningAsync();
-        let best = candidates.get(hubMac);
-        if (!best) {
-          for (const uuid of preferredHubUUIDs) {
-            if (candidates.has(uuid)) { best = candidates.get(uuid); break; }
-          }
+      function pickBest(): { p: any; addr: string; why: string } | null {
+        const hub = candidates.get(hubMac);
+        if (hub) return { p: hub.p, addr: hubMac, why: "relay hub from lights.json" };
+        for (const uuid of preferredHubUUIDs) {
+          const c = candidates.get(uuid);
+          if (c) return { p: c.p, addr: uuid, why: "known-good proxy" };
         }
-        if (!best) best = candidates.values().next().value;
-        const addr = (best.address || best.id || "").toLowerCase().replace(/-/g, ":");
-        doConnect(best, addr).then(resolve);
-      }, 5000);
+        const usable = [...candidates.entries()].filter(([, c]) => c.rssi >= MIN_RSSI);
+        if (usable.length === 0) return null;
+        // Strongest signal wins; on a tie, the one with the proxy service.
+        // Proximity is the more reliable sign of being in the right room and so
+        // in our own mesh — the proxy service alone is not, because foreign mesh
+        // devices advertise it just the same.
+        usable.sort((a, b) => (b[1].rssi - a[1].rssi) || (Number(b[1].proxy) - Number(a[1].proxy)));
+        const [addr, c] = usable[0];
+        return { p: c.p, addr, why: `${c.rssi} dBm${c.proxy ? ", proxy service" : ", name match only"}` };
+      }
+
+      // Collect first, then decide — and re-check on EVERY new find. The old
+      // version decided once after 5 s and gave up if nothing was there by then;
+      // devices showing up later were still logged but never chosen. That
+      // produced "No Amaran lights found" right below a "Found" line.
+      const decideAfter = Date.now() + Number(process.env.AMARAN_COLLECT_MS ?? 5000);
+      function tryDecide(): void {
+        if (found || Date.now() < decideAfter) return;
+        const best = pickBest();
+        if (!best) return;
+        found = true;
+        clearInterval(decider);
+        noble.stopScanningAsync();
+        console.log(`  Chosen: ${best.p.advertisement?.localName || best.addr} (${best.why})`);
+        doConnect(best.p, best.addr).then(resolve);
+      }
+      const decider = setInterval(tryDecide, 1000);
 
       setTimeout(async () => {
-        clearTimeout(hubWait);
+        clearInterval(decider);
         if (!found) {
+          found = true;
           await noble.stopScanningAsync();
-          console.error("No Amaran lights found. Make sure the Amaran Desktop app is closed.");
+          const seen = [...candidates.values()]
+            .map(c => `${c.label} ${c.rssi} dBm`).join(", ") || "none";
+          console.error(`No Amaran lights found. Seen: ${seen} (threshold ${MIN_RSSI} dBm).`);
+          console.error("Make sure the Amaran Desktop app is closed.");
           resolve(false);
         }
-      }, 15000);
+      }, Number(process.env.AMARAN_SCAN_MS ?? 15000));
 
       async function doConnect(p: any, addr: string): Promise<boolean> {
         console.log(`Connecting to ${p.advertisement.localName || addr} (${addr})...`);
         try {
-          await p.connectAsync();
+          // A BLE device accepts ONE connection. If another computer holds it,
+          // connectAsync simply never answers — on 2026-09-11 the daemon hung
+          // like that for 28 minutes without the guard noticing. Better to fail
+          // fast: the guard restarts, and the next run takes the node once free.
+          const connectMs = Number(process.env.AMARAN_CONNECT_MS ?? 12000);
+          const ok = await Promise.race([
+            p.connectAsync().then(() => true),
+            new Promise<boolean>(r => setTimeout(() => r(false), connectMs)),
+          ]);
+          if (!ok) {
+            console.error(`  ✗ No answer to the connection attempt within ${connectMs} ms — node busy or out of range.`);
+            try { await p.disconnectAsync(); } catch { /* doesn't matter */ }
+            return false;
+          }
           self.peripheral = p;
 
           const { characteristics } = await p.discoverSomeServicesAndCharacteristicsAsync(
@@ -455,6 +512,10 @@ export class MeshController {
           self.dataOut.on("data", (d: Buffer) => self.onNotify(d));
           await self.dataOut.subscribeAsync();
           console.log(`Connected to ${p.advertisement.localName || addr}`);
+          // Per the spec, the Mesh Proxy Data In characteristic is "write without
+          // response". If it says anything else here, the node is no regular
+          // proxy — and acknowledged writes would be wrong there.
+          console.log(`  dataIn: ${(self.dataIn.properties ?? []).join(",")} | dataOut: ${(self.dataOut.properties ?? []).join(",")}`);
           return true;
         } catch (err) {
           console.error("Connection error:", err);
@@ -506,10 +567,19 @@ export class MeshController {
   // Wraps a writeAsync with a hard timeout: on macOS+noble, writeWithoutResponse
   // sometimes never resolves its confirmation callback even though the bytes
   // were delivered. We treat slow writes as "fire and forget" after a few seconds.
+  // "Write Without Response" is unacknowledged: the local stack takes the data
+  // and reports success without the other side confirming anything. An "ok"
+  // here says NOTHING about delivery — only that macOS accepted the buffer. A
+  // failure used to be completely invisible, because no caller looks at the
+  // return value.
   private async writeWithTimeout(char: any, data: Buffer, withoutResponse: boolean, ms = 3000): Promise<"ok" | "timeout"> {
-    const writeP = char.writeAsync(data, withoutResponse).then(() => "ok" as const);
+    const writeP = char.writeAsync(data, withoutResponse)
+      .then(() => "ok" as const)
+      .catch((e: any) => { console.error(`  ✗ write error (${data.length} B): ${e?.message ?? e}`); return "timeout" as const; });
     const timeoutP = new Promise<"timeout">(r => setTimeout(() => r("timeout"), ms));
-    return Promise.race([writeP, timeoutP]);
+    const res = await Promise.race([writeP, timeoutP]);
+    if (res === "timeout") console.error(`  ✗ write not confirmed after ${ms} ms (${data.length} B).`);
+    return res;
   }
 
   // Mirrors what the Telink SDK does in normalConnectPeripheral after subscribing to notifications:
@@ -528,17 +598,27 @@ export class MeshController {
       PROXY_CFG_SET_FILTER_TYPE,
       Buffer.from([PROXY_FILTER_WHITELIST])
     );
+    // 2. Arm the receiver for the Filter Status reply BEFORE writing. If the
+    //    reply arrives before the write callback returns, filterStatusResolve
+    //    would otherwise still be null and the reply would be lost — and you
+    //    could not tell whether the light answered or stayed silent.
+    let settle!: (answered: boolean) => void;
+    const filterStatus = new Promise<boolean>(resolve => { settle = resolve; });
+    this.filterStatusResolve = () => { this.filterStatusResolve = null; settle(true); };
+
     console.log(`  → Proxy: Set Filter Type = Whitelist  ${setFilterPDU.toString("hex")}`);
     await this.writeWithTimeout(this.dataIn, setFilterPDU, true);
 
-    // 2. Wait for Filter Status response (up to 2s)
-    await new Promise<void>((resolve) => {
-      const timer = setTimeout(() => {
-        this.filterStatusResolve = null;
-        resolve();
-      }, 2000);
-      this.filterStatusResolve = () => { clearTimeout(timer); resolve(); };
-    });
+    // The two seconds run from the write, not from arming.
+    const statusTimer = setTimeout(() => {
+      this.filterStatusResolve = null;
+      settle(false);
+    }, 2000);
+    const answered = await filterStatus;
+    clearTimeout(statusTimer);
+    console.log(answered
+      ? "  ← Proxy: Filter Status received"
+      : "  ✗ Proxy: no Filter Status reply within 2 s");
 
     // 3. Whitelist: us, broadcast, group-all, AND every light address from config.
     //    Adding light addresses means the proxy will forward traffic addressed

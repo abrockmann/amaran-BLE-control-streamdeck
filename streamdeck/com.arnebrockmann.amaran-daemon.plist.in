@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.arnebrockmann.amaran-daemon</string>
+	<!-- Calls the guard, not "open -a" directly: it starts the daemon when it is
+	     missing AND restarts it when it is older than the Mac's last wake-up —
+	     after a sleep cycle the mesh session is dead without the daemon noticing.
+	     The guard starts it through "open -a", so macOS attributes the
+	     Bluetooth request to the app bundle. -->
+	<key>ProgramArguments</key>
+	<array>
+		<string>__GUARD__</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StartInterval</key>
+	<integer>60</integer>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>StandardOutPath</key>
+	<string>__HOME__/Library/Logs/amaran-daemon-launch.out</string>
+	<key>StandardErrorPath</key>
+	<string>__HOME__/Library/Logs/amaran-daemon-launch.err</string>
+</dict>
+</plist>

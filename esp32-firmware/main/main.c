@@ -18,6 +18,7 @@
 
 #include "driver/uart.h"
 #include "esp_log.h"
+#include "esp_ota_ops.h"
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -198,6 +199,22 @@ static const amaran_light_t *light_by_addr(uint16_t addr)
     return NULL;
 }
 
+/* Defined with the on/off delivery check below. */
+static bool onoff_status_seen(uint16_t src, bool on);
+
+/* Bluetooth reach per fixture, for GET /status: how many status requests went
+ * out and how many replies came back. A fixture that is out of range answers
+ * none; a marginal one answers some. */
+static uint32_t s_asked[AMARAN_LIGHT_COUNT];
+static uint32_t s_heard[AMARAN_LIGHT_COUNT];
+static int64_t  s_heard_us[AMARAN_LIGHT_COUNT];
+
+static void count_asked(uint16_t addr)
+{
+    const amaran_light_t *l = light_by_addr(addr);
+    if (l) s_asked[l - AMARAN_LIGHTS]++;
+}
+
 /* Strong implementation of the weak hook in the patched BLE Mesh core
  * (net.c). Called with the decrypted access payload of every inbound
  * AppKey-encrypted unsegmented message — in particular the fixtures' 0x26
@@ -221,10 +238,17 @@ void amaran_mesh_access_rx(uint16_t src, uint16_t dst,
     }
 
     const amaran_light_t *l = light_by_addr(src);
+    if (l) {
+        s_heard[l - AMARAN_LIGHTS]++;
+        s_heard_us[l - AMARAN_LIGHTS] = esp_timer_get_time();
+    }
     ESP_LOGI(TAG, "STATUS %s on=%d %s bri=%u%% cct=%uK gm=%d hue=%u sat=%u",
              l ? l->key : "?", st.on, st.is_hs ? "hsi" : "cct",
              st.intensity / 10, st.cct_kelvin, st.gm, st.hue, st.sat);
 
+    if (!onoff_status_seen(src, st.on)) {
+        return;                         /* on/off still being repeated */
+    }
     amaran_mqtt_report_state(src, st.on, st.is_hs, st.intensity / 10,
                              st.cct_kelvin, st.gm, st.hue, st.sat);
 }
@@ -301,14 +325,188 @@ static int send_telink_to(uint16_t dst, const uint8_t payload[10]);
 /* Adapters used by MQTT and HTTP. Same mesh send underneath; just different
  * argument shapes. */
 /* Forward decl so the disp_* setters can schedule a follow-up refresh. */
-static void schedule_refresh(void);
+static void schedule_refresh(uint16_t dst);
 
-static void disp_on_off(uint16_t dst, bool on)
+/* ---- delivery check for on/off ------------------------------------------
+ * The Telink protocol has no command ack: "sent" is not "arrived". Measured
+ * 2026-09-13 with the serial log: 2 of 4 on/off commands sent via HTTP never
+ * reached the Verge Max (its status replies 1 s and 10 s later still showed
+ * the old state), while the polls in between were answered. A lost command
+ * looks like a slow button to the user.
+ *
+ * So an on/off to a single fixture is followed by a status request and
+ * repeated until the fixture reports the wanted state. On/off is absolute, so
+ * a repeat that crosses a late success changes nothing.
+ *
+ * How the repeats are spaced was measured (Verge Max, 2026-09-13):
+ * - Status request sent together with the command: the reply often showed
+ *   the old state within 150-260 ms, so that told nothing.
+ * - Ask 200 ms after a single send: "on" confirmed 3/3 on the first send,
+ *   "off" 1/3 (then after 3 sends; once not after 4). Commands to a LIT
+ *   fixture are the ones that get lost.
+ * - Three sends back to back (~270 ms on air): "off" still 1/5 on the first
+ *   attempt; the repeats that worked came ~0.8 s later. Bunching doesn't
+ *   help — a lit fixture seems to listen in intervals.
+ * So each attempt spreads ONOFF_SPREAD sends ONOFF_TICK_US apart, asks for
+ * status after them, and judges at the end of the cycle. Raising
+ * net_transmit instead would stretch every message, including each step of
+ * a brightness knob (the adv task sends one message after another). */
+#define ONOFF_TICK_US       200000
+#define ONOFF_SPREAD        3   /* sends at 0 / 200 / 400 ms */
+#define ONOFF_CYCLE_TICKS   5   /* ask at 600 ms, verdict at 1000 ms */
+#define ONOFF_MAX_ATTEMPTS  AMARAN_ONOFF_ROUNDS
+
+typedef struct {
+    bool     pending;
+    bool     want_on;
+    uint8_t  attempts;
+    uint8_t  ticks;      /* timer ticks since the attempt began */
+    int64_t  first_us;
+} onoff_pending_t;
+
+static onoff_pending_t s_onoff[AMARAN_LIGHT_COUNT];
+static portMUX_TYPE s_onoff_mux = portMUX_INITIALIZER_UNLOCKED;
+static amaran_onoff_diag_t s_onoff_diag;   /* guarded by s_onoff_mux */
+static esp_timer_handle_t s_onoff_timer;
+
+static void send_onoff_cmd(uint16_t dst, bool on)
 {
     uint8_t p[10];
     amaran_telink_onoff(on, p);
     send_telink_to(dst, p);
-    schedule_refresh();
+}
+
+static void send_status_request(uint16_t dst)
+{
+    uint8_t p[10];
+    amaran_telink_status_request(p);
+    send_telink_to(dst, p);
+    count_asked(dst);
+}
+
+/* Runs every ONOFF_TICK_US while any on/off is unconfirmed. Confirmed ones
+ * were cleared by onoff_status_seen in between. */
+static void onoff_timer_cb(void *arg)
+{
+    enum { NONE, SEND, ASK, RETRY, GIVE_UP } act;
+    bool again = false;
+    for (int i = 0; i < AMARAN_LIGHT_COUNT; i++) {
+        bool want;
+        uint8_t attempts;
+        portENTER_CRITICAL(&s_onoff_mux);
+        onoff_pending_t *q = &s_onoff[i];
+        act = NONE;
+        if (q->pending) {
+            q->ticks++;
+            if (q->ticks < ONOFF_SPREAD) {
+                act = SEND;
+            } else if (q->ticks == ONOFF_SPREAD) {
+                act = ASK;
+            } else if (q->ticks >= ONOFF_CYCLE_TICKS) {
+                if (q->attempts >= ONOFF_MAX_ATTEMPTS) {
+                    q->pending = false;
+                    s_onoff_diag.not_confirmed++;
+                    act = GIVE_UP;
+                } else {
+                    q->attempts++;
+                    q->ticks = 0;
+                    act = RETRY;
+                }
+            }
+            again = again || q->pending;
+        }
+        want = q->want_on;
+        attempts = q->attempts;
+        portEXIT_CRITICAL(&s_onoff_mux);
+
+        uint16_t addr = AMARAN_LIGHTS[i].address;
+        switch (act) {
+        case SEND:
+            send_onoff_cmd(addr, want);
+            break;
+        case ASK:
+            send_status_request(addr);
+            break;
+        case RETRY:
+            ESP_LOGI(TAG, "%s: %s unconfirmed, round %u",
+                     AMARAN_LIGHTS[i].key, want ? "on" : "off", attempts);
+            send_onoff_cmd(addr, want);
+            break;
+        case GIVE_UP:
+            /* Stop suppressing the fixture's reports; one more status request
+             * lets the real state reach HA and /lights right away. */
+            ESP_LOGW(TAG, "%s: %s not confirmed after %u rounds",
+                     AMARAN_LIGHTS[i].key, want ? "on" : "off", attempts);
+            send_status_request(addr);
+            break;
+        default:
+            break;
+        }
+    }
+    if (again) {
+        esp_timer_start_once(s_onoff_timer, ONOFF_TICK_US);
+    }
+}
+
+/* Called for every decoded status reply. Returns false while an on/off to
+ * this fixture is still unconfirmed and the reply shows the old state — the
+ * caller then must not report it, or HA would flip back and forth. */
+static bool onoff_status_seen(uint16_t src, bool on)
+{
+    const amaran_light_t *l = light_by_addr(src);
+    if (!l) return true;
+    int i = (int)(l - AMARAN_LIGHTS);
+
+    bool confirmed = false, report = true;
+    uint8_t sends = 0;
+    int64_t ms = 0;
+    portENTER_CRITICAL(&s_onoff_mux);
+    onoff_pending_t *q = &s_onoff[i];
+    if (q->pending) {
+        if (q->want_on == on) {
+            q->pending = false;
+            confirmed = true;
+            if (q->attempts >= 1 && q->attempts <= ONOFF_MAX_ATTEMPTS) {
+                s_onoff_diag.confirmed_in_round[q->attempts - 1]++;
+            }
+            sends = q->attempts;
+            ms = (esp_timer_get_time() - q->first_us) / 1000;
+        } else {
+            report = false;
+        }
+    }
+    portEXIT_CRITICAL(&s_onoff_mux);
+
+    if (confirmed) {
+        ESP_LOGI(TAG, "%s: %s confirmed after %lld ms, round %u",
+                 l->key, on ? "on" : "off", ms, sends);
+    } else if (!report) {
+        ESP_LOGI(TAG, "%s: status still shows %s", l->key, on ? "on" : "off");
+    }
+    return report;
+}
+
+static void disp_on_off(uint16_t dst, bool on)
+{
+    const amaran_light_t *l = light_by_addr(dst);
+    if (!l || !s_onoff_timer) {
+        /* Group or unknown address: no single status to wait for. */
+        send_onoff_cmd(dst, on);
+        schedule_refresh(dst);
+        return;
+    }
+    int i = (int)(l - AMARAN_LIGHTS);
+    portENTER_CRITICAL(&s_onoff_mux);
+    s_onoff[i] = (onoff_pending_t){ .pending = true, .want_on = on,
+                                    .attempts = 1, .ticks = 0,
+                                    .first_us = esp_timer_get_time() };
+    bool start = !esp_timer_is_active(s_onoff_timer);
+    portEXIT_CRITICAL(&s_onoff_mux);
+
+    send_onoff_cmd(dst, on);
+    if (start) {
+        esp_timer_start_once(s_onoff_timer, ONOFF_TICK_US);
+    }
 }
 static void disp_brightness(uint16_t dst, int pct)
 {
@@ -317,7 +515,7 @@ static void disp_brightness(uint16_t dst, int pct)
     uint8_t p[10];
     amaran_telink_brightness((uint16_t)(pct * 10), p);
     send_telink_to(dst, p);
-    schedule_refresh();
+    schedule_refresh(dst);
 }
 static void disp_cct(uint16_t dst, int kelvin, int pct, int gm)
 {
@@ -328,7 +526,7 @@ static void disp_cct(uint16_t dst, int kelvin, int pct, int gm)
     uint8_t p[10];
     amaran_telink_cct((uint16_t)kelvin, (uint16_t)(pct * 10), gm, p);
     send_telink_to(dst, p);
-    schedule_refresh();
+    schedule_refresh(dst);
 }
 static void disp_hsi(uint16_t dst, int hue, int sat, int pct)
 {
@@ -338,7 +536,7 @@ static void disp_hsi(uint16_t dst, int hue, int sat, int pct)
     amaran_telink_hsi((uint16_t)hue, (uint8_t)sat,
                       (uint16_t)(pct * 10), p);
     send_telink_to(dst, p);
-    schedule_refresh();
+    schedule_refresh(dst);
 }
 
 /* Send a Telink status-request to each fixture (or just the one matching
@@ -353,11 +551,30 @@ static void disp_refresh(uint16_t dst)
         /* Loop per-fixture so each reply is unambiguous. */
         for (size_t i = 0; i < AMARAN_LIGHT_COUNT; i++) {
             send_telink_to(AMARAN_LIGHTS[i].address, p);
+            count_asked(AMARAN_LIGHTS[i].address);
             vTaskDelay(pdMS_TO_TICKS(80));
         }
     } else {
         send_telink_to(dst, p);
+        count_asked(dst);
     }
+}
+
+void amaran_node_fixture_diag(int idx, amaran_fixture_diag_t *out)
+{
+    if (!out || idx < 0 || idx >= (int)AMARAN_LIGHT_COUNT) return;
+    out->asked = s_asked[idx];
+    out->heard = s_heard[idx];
+    int64_t at = s_heard_us[idx];
+    out->heard_s_ago = at ? (int32_t)((esp_timer_get_time() - at) / 1000000) : -1;
+}
+
+void amaran_node_onoff_diag(amaran_onoff_diag_t *out)
+{
+    if (!out) return;
+    portENTER_CRITICAL(&s_onoff_mux);
+    *out = s_onoff_diag;
+    portEXIT_CRITICAL(&s_onoff_mux);
 }
 
 /* Periodic poll: every POLL_INTERVAL_MS, status-request every fixture so
@@ -387,14 +604,31 @@ static void poll_task(void *arg)
 static esp_timer_handle_t s_refresh_timer;
 #define REFRESH_DEBOUNCE_US 600000
 
+/* Only the fixture that was commanded gets asked. Asking all of them meant
+ * seven status requests 80 ms apart for every slider step — radio time the
+ * Wi-Fi side then waited for — and blocked the esp_timer task for ~0.5 s. */
+static uint16_t s_refresh_dst;
+static bool s_refresh_armed;
+static portMUX_TYPE s_refresh_mux = portMUX_INITIALIZER_UNLOCKED;
+
 static void refresh_timer_cb(void *arg)
 {
-    disp_refresh(AMARAN_GROUP_ALL);
+    portENTER_CRITICAL(&s_refresh_mux);
+    uint16_t dst = s_refresh_dst;
+    s_refresh_armed = false;
+    portEXIT_CRITICAL(&s_refresh_mux);
+    disp_refresh(dst);
 }
 
-static void schedule_refresh(void)
+static void schedule_refresh(uint16_t dst)
 {
     if (!s_refresh_timer) return;
+    portENTER_CRITICAL(&s_refresh_mux);
+    /* Two different fixtures inside one debounce window: ask everyone. */
+    s_refresh_dst = (s_refresh_armed && s_refresh_dst != dst)
+                        ? AMARAN_GROUP_ALL : dst;
+    s_refresh_armed = true;
+    portEXIT_CRITICAL(&s_refresh_mux);
     esp_timer_stop(s_refresh_timer);
     esp_timer_start_once(s_refresh_timer, REFRESH_DEBOUNCE_US);
 }
@@ -407,11 +641,57 @@ static const amaran_mqtt_dispatch_t g_dispatch = {
     .refresh = disp_refresh,
 };
 
+/* OTA rollback (CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE, since 2026-09-13). A new
+ * image boots "pending verify" and has to prove itself: the HTTP server — the
+ * way to the next update — must be up, and the device must stay alive for a
+ * minute after that. Only then is the image marked valid. If it crashes or a
+ * watchdog resets it before, the bootloader starts the previous image instead of
+ * looping on the broken one until someone brings a USB cable. */
+#define IMAGE_CONFIRM_DELAY_US (60LL * 1000 * 1000)
+static esp_timer_handle_t s_confirm_timer;
+
+static void confirm_image_cb(void *arg)
+{
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t state;
+    if (!running || esp_ota_get_state_partition(running, &state) != ESP_OK
+        || state != ESP_OTA_IMG_PENDING_VERIFY) {
+        return;                       /* flashed over USB, or already confirmed */
+    }
+    if (esp_ota_mark_app_valid_cancel_rollback() == ESP_OK) {
+        ESP_LOGI(TAG, "image on %s confirmed, rollback cancelled", running->label);
+    } else {
+        ESP_LOGE(TAG, "could not confirm image on %s", running->label);
+    }
+}
+
 static void on_wifi_ip(void)
 {
+    /* Called on EVERY IP_EVENT_STA_GOT_IP — also after each Wi-Fi reconnect,
+     * because esp_netif zeroes the address on disconnect, so even the same
+     * address counts as new. Starting MQTT again created a second client with
+     * the same default client ID (ESP32_<mac>): the broker hands the session
+     * back and forth between the two ("session taken over"), the old client
+     * keeps running without a handle, and the light state resets to defaults.
+     * esp-mqtt reconnects by itself and the HTTP server stays bound, so both
+     * are started exactly once. Not yet seen in the field: in the broker log of
+     * 2026-09-12/13 every takeover was a reboot. */
+    static bool mqtt_started = false, http_started = false;
+    if (mqtt_started && http_started) {
+        ESP_LOGI(TAG, "wifi back; mqtt reconnects by itself, http keeps listening");
+        return;
+    }
     ESP_LOGI(TAG, "wifi up; starting mqtt + http");
-    amaran_mqtt_start(&g_dispatch);
-    amaran_http_start(&g_dispatch);
+    /* Separate flags: a start that failed is tried again at the next GOT_IP,
+     * without starting the other one twice. */
+    if (!mqtt_started) mqtt_started = amaran_mqtt_start(&g_dispatch) == 0;
+    if (!http_started) http_started = amaran_http_start(&g_dispatch) == 0;
+    if (http_started && !s_confirm_timer) {
+        const esp_timer_create_args_t args = { .callback = confirm_image_cb, .name = "amaran_confirm" };
+        if (esp_timer_create(&args, &s_confirm_timer) == ESP_OK) {
+            esp_timer_start_once(s_confirm_timer, IMAGE_CONFIRM_DELAY_US);
+        }
+    }
 }
 
 static int send_telink_to(uint16_t dst, const uint8_t payload[10])
@@ -648,6 +928,12 @@ void app_main(void)
         .name = "amaran_refresh",
     };
     esp_timer_create(&refresh_args, &s_refresh_timer);
+
+    const esp_timer_create_args_t onoff_args = {
+        .callback = onoff_timer_cb,
+        .name = "amaran_onoff",
+    };
+    esp_timer_create(&onoff_args, &s_onoff_timer);
 
     xTaskCreate(uart_task, "uart_cli", 4096, NULL, 5, NULL);
     xTaskCreate(poll_task, "amaran_poll", 3072, NULL, 4, NULL);

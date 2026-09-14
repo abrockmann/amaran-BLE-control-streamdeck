@@ -8,6 +8,7 @@
 #define AMARAN_WIFI_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -17,6 +18,9 @@ typedef void (*amaran_wifi_got_ip_cb_t)(void);
 
 int amaran_wifi_start(amaran_wifi_got_ip_cb_t got_ip_cb);
 bool amaran_wifi_is_connected(void);
+/* Wi-Fi reconnects since boot that got an IP address again (the first one
+ * does not count). */
+uint32_t amaran_wifi_reconnects(void);
 
 #ifdef __cplusplus
 }

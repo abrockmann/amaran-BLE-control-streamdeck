@@ -1,7 +1,18 @@
-# 4 MB flash. BLE Mesh stack alone uses ~1 MB; adding Wi-Fi + MQTT + HTTP
-# pushes the app close to 2 MB. NVS bumped to 0x10000 for mesh provisioning
-# state + a small store for runtime tweaks.
-# Name,   Type, SubType,  Offset,   Size,    Flags
+# 4 MB flash, with OTA since 2026-09-12 — otherwise every firmware change would
+# mean going back to the USB cable.
+#
+# The arithmetic, so later changes can follow it:
+#   0x400000 (4 MB) - 0x20000 (bootloader, table, nvs, otadata, phy) =
+#   0x3E0000 for BOTH app slots, i.e. 0x1F0000 (1.94 MB) per slot.
+#   The app currently weighs about 0x198000 (1.6 MB) — roughly 18 % headroom.
+#   If it grows too big, the build fails visibly in check_sizes.py; this is not
+#   a silent failure. The way back is then a single factory partition, which
+#   costs a trip to the cable again.
+#
+# App slots must be aligned to 0x10000, otadata needs 0x2000.
+# Name,   Type, SubType,  Offset,   Size,     Flags
 nvs,      data, nvs,      0x9000,   0x10000,
-phy_init, data, phy,      0x19000,  0x1000,
-factory,  app,  factory,  0x20000,  0x300000,
+otadata,  data, ota,      0x19000,  0x2000,
+phy_init, data, phy,      0x1b000,  0x1000,
+ota_0,    app,  ota_0,    0x20000,  0x1F0000,
+ota_1,    app,  ota_1,    0x210000, 0x1F0000,

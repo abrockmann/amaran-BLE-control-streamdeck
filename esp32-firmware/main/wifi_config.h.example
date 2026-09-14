@@ -23,6 +23,18 @@
 #define MQTT_USERNAME   ""
 #define MQTT_PASSWORD   ""
 
+/* MQTT over TLS. Set MQTT_URI to "mqtts://<broker address>:8883" and paste the
+ * certificate of the CA that signed the broker's certificate, one string per
+ * line:
+ *   #define MQTT_CA_CERT \
+ *       "-----BEGIN CERTIFICATE-----\n" \
+ *       "MIIB...\n" \
+ *       "-----END CERTIFICATE-----\n"
+ * The broker certificate must name the address used in MQTT_URI (IP or host).
+ * Empty = plain mqtt://, and the MQTT password travels unencrypted.
+ * See esp32-firmware/README.md. */
+#define MQTT_CA_CERT        ""
+
 /* Home Assistant MQTT discovery prefix. Leave as "homeassistant" unless
  * you've changed it in HA's MQTT integration settings. */
 #define HA_DISCOVERY_PREFIX "homeassistant"
@@ -37,5 +49,14 @@
 
 /* HTTP REST API port. Default 80. */
 #define HTTP_PORT           80
+
+/* Token for firmware updates over Wi-Fi (POST /ota, header X-Amaran-Token).
+ * Empty disables OTA (the endpoint answers 503). Use a random value of its own
+ * and keep it in your password manager:
+ *   openssl rand -hex 16
+ * Don't derive it from another password: MQTT runs unencrypted, and a password
+ * read there would give the token away. Updates must also be signed — see
+ * esp32-firmware/README.md. */
+#define OTA_TOKEN           ""
 
 #endif /* AMARAN_WIFI_CONFIG_H */

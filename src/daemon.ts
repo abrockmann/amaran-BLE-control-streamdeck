@@ -11,6 +11,7 @@ import * as net from "net";
 import * as http from "http";
 import * as fs from "fs";
 import * as path from "path";
+import * as crypto from "crypto";
 import { SOCKET_PATH, PID_PATH } from "./daemon-paths.js";
 import { loadConfig, type LightConfig } from "./config.js";
 import { MeshController } from "./mesh-controller.js";
@@ -46,8 +47,11 @@ async function runDaemon() {
     const discoveryPrefix = mqttCfg.discoveryPrefix ?? "homeassistant";
     const topicPrefix     = mqttCfg.topicPrefix     ?? "amaran";
 
-    // Dynamically import so mqtt is only loaded when actually configured
-    const { connect: mqttConnect } = await import("mqtt");
+    // Dynamically import so mqtt is only loaded when actually configured.
+    // mqtt is an optional dependency (absent after `npm ci --omit=optional`);
+    // a non-literal specifier keeps the type checker from requiring it.
+    const mqttModule = "mqtt";
+    const { connect: mqttConnect } = await import(mqttModule);
     const mqttClient = mqttConnect(mqttCfg.broker, {
       username: mqttCfg.username,
       password: mqttCfg.password,
@@ -282,12 +286,35 @@ async function runDaemon() {
   });
 
   // ── HTTP REST server ─────────────────────────────────────────────────────────
-  const httpCfg = config.http ?? { port: 2708, host: "0.0.0.0" };
+  // Hardening: loopback by default. Binding to an address reachable on the
+  // network without an apiKey would be an open remote control for every device
+  // on the Wi-Fi — that is refused instead of silently opened.
+  const httpCfg = config.http ?? { port: 2708, host: "127.0.0.1" };
+  const LOOPBACK = ["127.0.0.1", "::1", "localhost"];
+  if (!LOOPBACK.includes(httpCfg.host) && !httpCfg.apiKey) {
+    console.error(
+      `Refusing to bind the HTTP API to ${httpCfg.host} without http.apiKey in lights.json.\n` +
+      `Set an apiKey, or use host "127.0.0.1".`
+    );
+    process.exit(1);
+  }
 
+  // Bodies are a few bytes of JSON; the cap keeps any local process from
+  // growing the daemon's memory without end.
+  const MAX_BODY = 8 * 1024;
   function readBody(req: http.IncomingMessage): Promise<any> {
     return new Promise((resolve, reject) => {
       let raw = "";
-      req.on("data", c => { raw += c; });
+      req.on("data", c => {
+        raw += c;
+        if (raw.length > MAX_BODY) {
+          // Stop collecting and discard the rest; the handler answers 400.
+          req.removeAllListeners("data");
+          req.resume();
+          raw = "";
+          reject(new Error("Body too large"));
+        }
+      });
       req.on("end", () => {
         if (!raw) { resolve({}); return; }
         try { resolve(JSON.parse(raw)); } catch { reject(new Error("Invalid JSON body")); }
@@ -305,14 +332,47 @@ async function runDaemon() {
     res.end(JSON.stringify(body));
   }
 
+  // Constant-time comparison of the API key (both sides hashed to equal length).
+  const keyMatches = (header: string) => {
+    const a = crypto.createHash("sha256").update(header).digest();
+    const b = crypto.createHash("sha256").update(`Bearer ${httpCfg.apiKey}`).digest();
+    return crypto.timingSafeEqual(a, b);
+  };
+  if (httpCfg.apiKey && httpCfg.apiKey.length < 32) {
+    console.warn("http.apiKey is shorter than 32 characters — generate one with: openssl rand -hex 32");
+  }
+
+  // Commands the HTTP API may run. The socket protocol also knows "stop", which
+  // over HTTP would let any caller shut the daemon down.
+  const HTTP_COMMANDS = new Set(["on", "off", "brightness", "cct", "hsi", "hsl"]);
+
   const httpServer = http.createServer(async (req, res) => {
+    // DNS rebinding: a web page whose name resolves to 127.0.0.1 is same-origin to
+    // its own name and could read GET /lights (names, MACs, addresses). On
+    // loopback only loopback names are accepted as Host.
+    if (LOOPBACK.includes(httpCfg.host)) {
+      const hostName = String(req.headers.host ?? "").replace(/:\d+$/, "").replace(/^\[(.*)\]$/, "$1");
+      if (!LOOPBACK.includes(hostName)) {
+        jsonResponse(res, 403, { ok: false, error: "Host not allowed" });
+        return;
+      }
+    }
+
     // CORS preflight
     if (req.method === "OPTIONS") { jsonResponse(res, 204, {}); return; }
+
+    // Drive-by protection: browsers always send an Origin header on requests
+    // from other sites, curl and Stream Deck don't. Without an apiKey this
+    // keeps an open web page from switching the light.
+    if (req.headers.origin && !httpCfg.apiKey) {
+      jsonResponse(res, 403, { ok: false, error: "Browser origins are not allowed without an apiKey" });
+      return;
+    }
 
     // Optional API key auth
     if (httpCfg.apiKey) {
       const authHeader = req.headers["authorization"] ?? "";
-      if (authHeader !== `Bearer ${httpCfg.apiKey}`) {
+      if (!keyMatches(String(authHeader))) {
         jsonResponse(res, 401, { ok: false, error: "Unauthorized" });
         return;
       }
@@ -340,6 +400,10 @@ async function runDaemon() {
       const lightMatch = url.match(/^\/lights\/([^/]+)\/([^/]+)$/);
       if (method === "POST" && lightMatch) {
         const [, lightKey, cmd] = lightMatch;
+        if (!HTTP_COMMANDS.has(cmd)) {
+          jsonResponse(res, 404, { ok: false, error: `Unknown command: ${cmd}` });
+          return;
+        }
         const body = await readBody(req);
         let args: string[] = [];
         if (cmd === "brightness" && body.value !== undefined) args = [String(body.value)];

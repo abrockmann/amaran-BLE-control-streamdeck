@@ -1,0 +1,8 @@
+{
+  "name": "amaran-streamdeck-pack",
+  "private": true,
+  "description": "Pinned Elgato CLI for streamdeck/pack-plugin.sh. The lockfile pins every dependency, not just the CLI.",
+  "devDependencies": {
+    "@elgato/cli": "1.9.0"
+  }
+}

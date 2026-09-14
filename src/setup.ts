@@ -9,7 +9,7 @@
  */
 
 import * as readline from "readline";
-import { execSync } from "child_process";
+import { execFileSync } from "child_process";
 import { findAmaranDB, saveConfig, type Config, type LightConfig } from "./config.js";
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -17,7 +17,9 @@ const ask = (q: string): Promise<string> =>
   new Promise(resolve => rl.question(q, a => resolve(a.trim())));
 
 function sqliteQuery(dbPath: string, sql: string): string {
-  return execSync(`sqlite3 "${dbPath}" "${sql}"`, { encoding: "utf-8" }).trim();
+  // execFileSync instead of execSync: no shell parsing, so special characters in
+  // the path cannot be interpreted as a command.
+  return execFileSync("sqlite3", [dbPath, sql], { encoding: "utf-8" }).trim();
 }
 
 function extractFromDB(dbPath: string): Partial<Config> & { lights: LightConfig[] } {
@@ -128,7 +130,7 @@ async function main() {
   saveConfig(config);
 
   console.log(`\n✓ Saved to lights.json`);
-  console.log(`  Relay hub: ${config.lights.find(l => l.uuid === config!.relayHub)?.name ?? config.relayHub}`);
+  console.log(`  Relay hub: ${config.lights.find(l => l.mac.toLowerCase() === config!.relayHub.toLowerCase())?.name ?? config.relayHub}`);
   console.log(`  ${config.lights.length} light(s) configured`);
   console.log("\nTry it:  npm run mesh:on");
 

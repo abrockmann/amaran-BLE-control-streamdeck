@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>amaran settings</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; padding: 12px 12px 16px; background: #2d2d2d; color: #d8d8d8;
+    font: 12px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  .row { display: grid; grid-template-columns: 96px 1fr; align-items: center; gap: 8px; margin-bottom: 10px; }
+  label { color: #969696; text-align: right; }
+  input, select {
+    width: 100%; box-sizing: border-box; height: 26px; padding: 0 8px;
+    background: #3d3d3d; color: #d8d8d8; border: 1px solid #4a4a4a; border-radius: 3px; font: inherit;
+  }
+  input:focus, select:focus { outline: none; border-color: #6a8fd6; }
+  .hint { grid-column: 2; color: #7d7d7d; font-size: 11px; margin-top: -6px; }
+  .status { grid-column: 2; font-size: 11px; min-height: 15px; }
+  .ok { color: #7fbf7f; }
+  .err { color: #e07a7a; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+  <div class="row">
+    <label for="host" data-t="bridge"></label>
+    <input id="host" type="text" spellcheck="false" autocomplete="off" placeholder="amaran-esp32.local">
+    <div class="hint" data-t="hostHint"></div>
+  </div>
+  <div class="row" id="lightRow">
+    <label for="light" data-t="light"></label>
+    <select id="light"></select>
+  </div>
+  <div class="row" id="keyRow" hidden>
+    <label for="key" data-t="light"></label>
+    <input id="key" type="text" spellcheck="false" autocomplete="off" placeholder="amaranve">
+    <div class="hint" data-t="keyHint"></div>
+  </div>
+  <div class="row">
+    <span></span>
+    <div class="status" id="status"></div>
+  </div>
+
+<script>
+"use strict";
+// Property inspector for all amaran actions. The bridge address is a global
+// setting (shared by all actions), the light a per-action setting. The list of
+// lights comes from the plugin: the bridge sends no CORS headers and the Mac
+// daemon refuses browser origins, so this page cannot fetch it itself.
+const TEXTS = {
+  en: {
+    bridge: "Bridge", light: "Light",
+    hostHint: "Name or IP of the ESP32 bridge. 127.0.0.1:2708 for the local Mac daemon.",
+    keyHint: "Light key from lights.json",
+    badKey: "Light keys may only contain letters, digits, _ and -",
+    searching: "Looking for lights…",
+    found: n => n === 1 ? "1 light found" : n + " lights found",
+    none: "The bridge reports no lights",
+    unreachable: (h, e) => "Bridge not reachable at " + h + (e ? " (" + e + ")" : ""),
+    daemonDown: e => "Mac daemon not running" + (e ? " (" + e + ")" : "") + " — enter the light key by hand",
+    local: "Local Mac daemon",
+  },
+  de: {
+    bridge: "Brücke", light: "Leuchte",
+    hostHint: "Name oder IP der ESP32-Brücke. 127.0.0.1:2708 für den lokalen Mac-Daemon.",
+    keyHint: "Leuchten-Kürzel aus lights.json",
+    badKey: "Leuchten-Kürzel dürfen nur Buchstaben, Ziffern, _ und - enthalten",
+    searching: "Suche Leuchten…",
+    found: n => n === 1 ? "1 Leuchte gefunden" : n + " Leuchten gefunden",
+    none: "Die Brücke meldet keine Leuchten",
+    unreachable: (h, e) => "Brücke nicht erreichbar unter " + h + (e ? " (" + e + ")" : ""),
+    daemonDown: e => "Mac-Daemon läuft nicht" + (e ? " (" + e + ")" : "") + " — Leuchten-Kürzel von Hand eintragen",
+    local: "Lokaler Mac-Daemon",
+  },
+};
+let T = TEXTS.en;
+let ws = null, uuid = null, action = null;
+let settings = {}, globalSettings = {};
+
+const $ = id => document.getElementById(id);
+const send = obj => ws && ws.readyState === 1 && ws.send(JSON.stringify(obj));
+
+function status(text, cls) {
+  const el = $("status");
+  el.textContent = text || "";
+  el.className = "status" + (cls ? " " + cls : "");
+}
+
+function hostString(g) {
+  if (!g.host) return "";
+  return g.port && Number(g.port) !== 80 ? g.host + ":" + g.port : g.host;
+}
+
+function requestLights() {
+  status(T.searching);
+  send({ event: "sendToPlugin", action, context: uuid,
+         payload: { type: "getLights", host: $("host").value.trim() } });
+}
+
+function saveGlobal() {
+  const typed = $("host").value.trim();
+  const [host, port] = typed.split(":");
+  globalSettings = typed ? { host, port: port ? Number(port) : undefined } : {};
+  send({ event: "setGlobalSettings", context: uuid, payload: globalSettings });
+  send({ event: "sendToPlugin", action, context: uuid, payload: { type: "settingsSaved" } });
+  requestLights();
+}
+
+// Same rule as the plugin: keys become file names there, so only plain names.
+const KEY_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
+function saveLight(key) {
+  if (!KEY_RE.test(key)) { status(T.badKey, "err"); return; }
+  settings = Object.assign({}, settings, { light: key });
+  send({ event: "setSettings", context: uuid, payload: settings });
+}
+
+function renderLights(p) {
+  if (!$("host").value) $("host").placeholder = p.host + (p.port !== 80 ? ":" + p.port : "");
+  // The light the action uses now: its own setting, else what the plugin fell
+  // back to (an older install's default). Not simply the first light in the list.
+  const want = settings.light || p.current || "";
+  // A Mac daemon that is not running cannot list its lights; then the key can
+  // be typed. Everything else picks from the list.
+  const manual = p.local && !p.ok;
+  $("lightRow").hidden = manual;
+  $("keyRow").hidden = !manual;
+  if (manual) { $("key").value = want; status(T.daemonDown(p.error), "err"); return; }
+  if (!p.ok) { status(T.unreachable(p.host, p.error), "err"); return; }
+
+  const select = $("light");
+  select.textContent = "";
+  p.lights = p.lights.filter(l => KEY_RE.test(l.key));
+  for (const l of p.lights) {
+    const o = document.createElement("option");
+    o.value = l.key;
+    const range = l.cct_min && l.cct_max ? " · " + l.cct_min + "–" + l.cct_max + " K" : "";
+    o.textContent = (l.name || l.key) + range;
+    select.appendChild(o);
+  }
+  if (!p.lights.length) { status(T.none, "err"); return; }
+  const current = p.lights.some(l => l.key === want) ? want : p.lights[0].key;
+  select.value = current;
+  if (current !== settings.light) saveLight(current);   // make the choice explicit
+  status((p.local ? T.local + " · " : "") + T.found(p.lights.length), "ok");
+}
+
+// Called by Stream Deck when the property inspector opens.
+function connectElgatoStreamDeckSocket(inPort, inUUID, inRegisterEvent, inInfo, inActionInfo) {
+  uuid = inUUID;
+  const info = JSON.parse(inInfo || "{}");
+  const actionInfo = JSON.parse(inActionInfo || "{}");
+  action = actionInfo.action;
+  settings = (actionInfo.payload && actionInfo.payload.settings) || {};
+  T = TEXTS[String((info.application && info.application.language) || "en").slice(0, 2)] || TEXTS.en;
+  document.querySelectorAll("[data-t]").forEach(el => { el.textContent = T[el.dataset.t]; });
+
+  ws = new WebSocket("ws://127.0.0.1:" + inPort);
+  ws.onopen = () => {
+    send({ event: inRegisterEvent, uuid: inUUID });
+    send({ event: "getGlobalSettings", context: inUUID });
+  };
+  ws.onmessage = evt => {
+    const msg = JSON.parse(evt.data);
+    const payload = msg.payload || {};
+    if (msg.event === "didReceiveGlobalSettings") {
+      globalSettings = payload.settings || {};
+      $("host").value = hostString(globalSettings);
+      requestLights();
+    } else if (msg.event === "didReceiveSettings") {
+      settings = payload.settings || {};
+      if (settings.light) { $("light").value = settings.light; $("key").value = settings.light; }
+    } else if (msg.event === "sendToPropertyInspector" && payload.type === "lights") {
+      renderLights(payload);
+    }
+  };
+}
+
+$("host").addEventListener("change", saveGlobal);
+$("light").addEventListener("change", e => saveLight(e.target.value));
+$("key").addEventListener("change", e => saveLight(e.target.value.trim()));
+</script>
+</body>
+</html>

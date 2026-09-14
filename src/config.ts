@@ -10,7 +10,7 @@ export interface LightConfig {
 
 export interface HttpConfig {
   port: number;   // default 2708
-  host: string;   // default "0.0.0.0"
+  host: string;   // default "127.0.0.1"; any other address requires apiKey
   apiKey?: string; // if set, requests must include Authorization: Bearer <apiKey>
 }
 
@@ -49,7 +49,9 @@ export function loadConfig(): Config {
 }
 
 export function saveConfig(config: Config): void {
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + "\n", "utf-8");
+  // Holds the mesh netKey/appKey — readable by the owner only (0600).
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + "\n", { encoding: "utf-8", mode: 0o600 });
+  try { fs.chmodSync(CONFIG_PATH, 0o600); } catch { /* e.g. on non-POSIX file systems */ }
 }
 
 export function configExists(): boolean {
