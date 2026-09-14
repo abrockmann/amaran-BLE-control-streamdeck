@@ -11,6 +11,7 @@
 #include "esp_app_desc.h"
 #include "esp_attr.h"
 #include "esp_heap_caps.h"
+#include "esp_http_client.h"
 #include "esp_ota_ops.h"
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -239,6 +240,123 @@ static const char *reset_reason_str(esp_reset_reason_t r)
     }
 }
 
+/* ---- confirming a new image ----------------------------------------------
+ * OTA rollback (CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE, since 2026-09-13): a new
+ * image boots "pending verify" and has to prove itself before it is marked valid.
+ * Until 2026-09-14 the proof was one minute of uptime after the HTTP server
+ * started. A review showed that is too little: the task watchdog only logs
+ * (CONFIG_ESP_TASK_WDT_PANIC is off), so an image whose HTTP task hangs or that
+ * runs out of memory got confirmed all the same — and a confirmed image that
+ * can't take the next upload needs the USB cable.
+ *
+ * Now a task asks the bridge's own HTTP server for /status over loopback (the
+ * server and task that must take the next upload) and checks that a block the
+ * size of a full TLS record is still free. First check after a minute, so a crash
+ * in that minute still rolls back; then every 10 s. An image that hasn't passed
+ * after 5 minutes of uptime is marked invalid and the device reboots into the
+ * previous one. Starts at boot, not at GOT_IP: an image that never gets onto the
+ * network rolls back too. */
+#define IMAGE_CHECK_FIRST_US     (60LL * 1000 * 1000)
+#define IMAGE_CHECK_INTERVAL_MS  10000
+#define IMAGE_CHECK_DEADLINE_US  (5LL * 60 * 1000 * 1000)
+/* mbedTLS's input buffer grows to the record size, at most 16 KB. A healthy
+ * bridge showed 59 KB as largest_free_block on 2026-09-14. */
+#define IMAGE_CHECK_MIN_BLOCK    16384
+
+static struct {
+    bool started;              /* this boot began pending_verify */
+    uint32_t checks;
+    const char *last_error;    /* NULL = last check passed */
+    uint32_t stack_free;       /* checker's least free stack, set when it ends */
+} s_image_check;
+
+/* The image the bootloader gave up on, read once at boot from the state of the
+ * other OTA slot. esp_ota_get_last_invalid_partition() did this per GET /status
+ * and validated that image each time (hash and signature over ~1.7 MB), and it
+ * returned NULL as soon as the next upload had erased the slot. */
+static const char *s_rolled_back_from;
+
+static const char *image_check_once(void)
+{
+    char url[40];
+    snprintf(url, sizeof(url), "http://127.0.0.1:%d/status", HTTP_PORT);
+    const esp_http_client_config_t cfg = { .url = url, .timeout_ms = 5000 };
+    esp_http_client_handle_t c = esp_http_client_init(&cfg);
+    if (!c) return "http client";
+    const char *err = NULL;
+    if (esp_http_client_perform(c) != ESP_OK) {
+        err = "http no answer";
+    } else if (esp_http_client_get_status_code(c) != 200) {
+        err = "http status";
+    }
+    esp_http_client_cleanup(c);
+    if (err) return err;
+    if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < IMAGE_CHECK_MIN_BLOCK) {
+        return "heap";
+    }
+    return NULL;
+}
+
+static void image_check_task(void *arg)
+{
+    const char *label = esp_ota_get_running_partition()->label;
+    int64_t deadline = IMAGE_CHECK_DEADLINE_US;
+    int64_t wait = IMAGE_CHECK_FIRST_US - esp_timer_get_time();
+    if (wait > 0) vTaskDelay(pdMS_TO_TICKS(wait / 1000));
+
+    for (;;) {
+        s_image_check.checks++;
+        const char *err = image_check_once();
+        if (!err) {
+            if (esp_ota_mark_app_valid_cancel_rollback() == ESP_OK) {
+                s_image_check.last_error = NULL;
+                ESP_LOGI(TAG, "image on %s confirmed after %" PRIu32 " check(s)", label, s_image_check.checks);
+                break;
+            }
+            err = "mark valid";
+        }
+        s_image_check.last_error = err;
+        ESP_LOGW(TAG, "image check %" PRIu32 " failed: %s", s_image_check.checks, err);
+        if (esp_timer_get_time() >= deadline) {
+            ESP_LOGE(TAG, "image on %s not confirmed within 5 min (%s), rolling back", label, err);
+            esp_err_t rc = esp_ota_mark_app_invalid_rollback_and_reboot();   /* returns only on failure */
+            ESP_LOGE(TAG, "rollback failed: %s", esp_err_to_name(rc));
+            s_image_check.last_error = "rollback failed";
+            deadline += IMAGE_CHECK_DEADLINE_US;   /* keep checking; try again later */
+        }
+        vTaskDelay(pdMS_TO_TICKS(IMAGE_CHECK_INTERVAL_MS));
+    }
+    s_image_check.stack_free = uxTaskGetStackHighWaterMark(NULL);
+    vTaskDelete(NULL);
+}
+
+void amaran_image_check_start(void)
+{
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    const esp_partition_t *other = esp_ota_get_next_update_partition(NULL);
+    esp_ota_img_states_t state;
+    if (other && other != running && esp_ota_get_state_partition(other, &state) == ESP_OK
+        && (state == ESP_OTA_IMG_INVALID || state == ESP_OTA_IMG_ABORTED)) {
+        s_rolled_back_from = other->label;
+    }
+
+    if (!running || esp_ota_get_state_partition(running, &state) != ESP_OK
+        || state != ESP_OTA_IMG_PENDING_VERIFY) {
+        return;                       /* flashed over USB, or already confirmed */
+    }
+    s_image_check.started = true;
+    /* Same stack as the HTTP task: the rollback path verifies the other image
+     * the way esp_ota_end does, and a stack overflow in the check would roll back
+     * a good image. The stack is freed once the image is confirmed. */
+    if (xTaskCreate(image_check_task, "amaran_imgchk", 8192, NULL, 2, NULL) != pdPASS) {
+        /* Not even this fits at boot: the image is not healthy. */
+        ESP_LOGE(TAG, "no memory for the image check, rolling back");
+        esp_err_t rc = esp_ota_mark_app_invalid_rollback_and_reboot();
+        ESP_LOGE(TAG, "rollback failed: %s", esp_err_to_name(rc));
+        s_image_check.last_error = "rollback failed";
+    }
+}
+
 /* GET /status — judge the bridge's placement without a USB cable.
  * wifi.rssi: signal to the access point (dBm; below about -70 gets slow).
  * fixtures[].heard/asked: share of status requests a fixture answered, i.e.
@@ -256,8 +374,9 @@ static esp_err_t status_get(httpd_req_t *req)
     cJSON_AddStringToObject(root, "elf_sha256", sha);
     const esp_partition_t *running = esp_ota_get_running_partition();
     cJSON_AddStringToObject(root, "partition", running ? running->label : "?");
-    /* Rollback state of the running image: "pending_verify" for the first
-     * minute after an OTA, then "valid"; "untracked" after a USB flash. */
+    /* Rollback state of the running image: "pending_verify" after an OTA until
+     * the image check passes (at the earliest after a minute), then "valid";
+     * "untracked" after a USB flash. */
     esp_ota_img_states_t img_state;
     const char *img = "untracked";
     if (running && esp_ota_get_state_partition(running, &img_state) == ESP_OK) {
@@ -267,9 +386,15 @@ static esp_err_t status_get(httpd_req_t *req)
             : img_state == ESP_OTA_IMG_UNDEFINED ? "undefined" : "invalid";
     }
     cJSON_AddStringToObject(root, "image_state", img);
+    if (s_image_check.started) {
+        cJSON *chk = cJSON_AddObjectToObject(root, "image_check");
+        cJSON_AddNumberToObject(chk, "checks", s_image_check.checks);
+        if (s_image_check.last_error) cJSON_AddStringToObject(chk, "last_error", s_image_check.last_error);
+        else cJSON_AddNullToObject(chk, "last_error");
+        if (s_image_check.stack_free) cJSON_AddNumberToObject(chk, "stack_free", s_image_check.stack_free);
+    }
     /* Set after the bootloader rolled back from a broken image. */
-    const esp_partition_t *invalid = esp_ota_get_last_invalid_partition();
-    if (invalid) cJSON_AddStringToObject(root, "rolled_back_from", invalid->label);
+    if (s_rolled_back_from) cJSON_AddStringToObject(root, "rolled_back_from", s_rolled_back_from);
     else cJSON_AddNullToObject(root, "rolled_back_from");
     cJSON_AddNumberToObject(root, "free_heap", esp_get_free_heap_size());
     cJSON_AddNumberToObject(root, "min_free_heap", esp_get_minimum_free_heap_size());
@@ -465,6 +590,21 @@ static esp_err_t lights_post(httpd_req_t *req)
  * Usage:  curl -X POST --data-binary @firmware.bin \
  *            -H "X-Amaran-Token: <token>" http://<ip>/ota
  */
+
+/* Error answer once an authorised upload has begun. Returns ESP_FAIL like the
+ * refusals: the server then closes the socket instead of reading the rest of a
+ * ~1.7 MB body first. */
+static esp_err_t ota_fail(httpd_req_t *req, const char *status, const char *error, int bytes)
+{
+    ota_trace(OTA_STAGE_FAILED, bytes);
+    httpd_resp_set_status(req, status);
+    httpd_resp_set_type(req, "application/json");
+    char body[64];
+    snprintf(body, sizeof(body), "{\"ok\":false,\"error\":\"%s\"}", error);
+    httpd_resp_sendstr(req, body);
+    return ESP_FAIL;
+}
+
 static esp_err_t ota_post(httpd_req_t *req)
 {
     char token[128] = {0};
@@ -485,18 +625,28 @@ static esp_err_t ota_post(httpd_req_t *req)
         return ESP_FAIL;
     }
 
+    ota_trace(OTA_STAGE_BEGIN, 0);
+    /* While the running image is still unconfirmed, esp_ota_begin refuses with
+     * ESP_ERR_OTA_ROLLBACK_INVALID_STATE. Until 2026-09-14 that came back as a
+     * 500 "ota begin" — after the whole body had been read. */
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t state;
+    if (running && esp_ota_get_state_partition(running, &state) == ESP_OK
+        && state == ESP_OTA_IMG_PENDING_VERIFY) {
+        ESP_LOGW(TAG, "OTA refused: running image not confirmed yet");
+        return ota_fail(req, "409 Conflict", "pending_verify", 0);
+    }
     const esp_partition_t *target = esp_ota_get_next_update_partition(NULL);
     if (!target) {
-        httpd_resp_set_status(req, "500 Internal Server Error");
-        return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"no ota partition\"}");
+        return ota_fail(req, "500 Internal Server Error", "no ota partition", 0);
     }
     ESP_LOGI(TAG, "OTA to %s, expecting %d bytes", target->label, req->content_len);
-    ota_trace(OTA_STAGE_BEGIN, 0);
 
     esp_ota_handle_t h = 0;
-    if (esp_ota_begin(target, OTA_SIZE_UNKNOWN, &h) != ESP_OK) {
-        httpd_resp_set_status(req, "500 Internal Server Error");
-        return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"ota begin\"}");
+    esp_err_t rc = esp_ota_begin(target, OTA_SIZE_UNKNOWN, &h);
+    if (rc != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_begin: %s", esp_err_to_name(rc));
+        return ota_fail(req, "500 Internal Server Error", "ota begin", 0);
     }
 
     char buf[1024];
@@ -510,17 +660,13 @@ static esp_err_t ota_post(httpd_req_t *req)
             continue;
         }
         if (n <= 0) {
-            ota_trace(OTA_STAGE_FAILED, total);
             esp_ota_abort(h);
             ESP_LOGE(TAG, "OTA aborted after %d bytes (recv=%d)", total, n);
-            httpd_resp_set_status(req, "400 Bad Request");
-            return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"recv\"}");
+            return ota_fail(req, "400 Bad Request", "recv", total);
         }
         if (esp_ota_write(h, buf, n) != ESP_OK) {
-            ota_trace(OTA_STAGE_FAILED, total);
             esp_ota_abort(h);
-            httpd_resp_set_status(req, "500 Internal Server Error");
-            return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"write\"}");
+            return ota_fail(req, "500 Internal Server Error", "write", total);
         }
         total += n; rest -= n;
         ota_trace(OTA_STAGE_RECEIVING, total);
@@ -531,10 +677,8 @@ static esp_err_t ota_post(httpd_req_t *req)
      * the boot partition switch — otherwise the device would boot half an image,
      * or a foreign one. */
     if (esp_ota_end(h) != ESP_OK || esp_ota_set_boot_partition(target) != ESP_OK) {
-        ota_trace(OTA_STAGE_FAILED, total);
         ESP_LOGE(TAG, "OTA image invalid, boot partition unchanged");
-        httpd_resp_set_status(req, "400 Bad Request");
-        return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"invalid image\"}");
+        return ota_fail(req, "400 Bad Request", "invalid image", total);
     }
 
     ota_trace(OTA_STAGE_DONE, total);

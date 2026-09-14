@@ -485,7 +485,8 @@ token with the signed image accepted and booted. Locally, `espsecure.py
 verify_signature` accepts the signed image and rejects the unsigned one.
 
 **OTA rollback — done 2026-09-13**, with one USB flash for the bootloader. A new
-image is confirmed only after a minute with HTTP up. Tested with a signed image
+image is confirmed only after a minute with HTTP up (replaced by a real health
+check on 2026-09-14, see below). Tested with a signed image
 that aborted 20 s after boot: the bootloader went back to the previous image
 (serial log and `/status` agree), and a normal update went from `pending_verify`
 to `valid` after a minute. Before the flash the whole 4 MB were read out as a
@@ -518,6 +519,29 @@ itself. Checked: the broker refused the bridge 24 times while it still had the o
 password and accepted it right after the change, a wrong password is refused, and
 Home Assistant receives the bridge's state messages again. The old password itself
 could not be tried — it was overwritten everywhere it was stored.
+
+**Review of rollback and TLS — fixed 2026-09-14.** An independent review of the
+changes that added OTA rollback and MQTT over TLS found four issues; each claim about ESP-IDF was
+checked against the v5.3.2 sources first.
+
+| Severity | Finding | Fix |
+| --- | --- | --- |
+| Medium | A new image was confirmed 60 s after the HTTP server started, with no check. The task watchdog only logs, so an image with a hung HTTP task or a memory leak would have been confirmed and locked out OTA. A failed timer creation or a failed confirm was never retried | a task started at boot requires `GET /status` = 200 over loopback and a free block ≥ 16 KB; first check after a minute, then every 10 s; no success within 5 minutes of uptime → marks itself invalid and restarts into the previous image |
+| Low | `POST /ota` while `pending_verify`: ESP-IDF refuses, the handler answered 500 `ota begin` only after reading the whole ~1.7 MB body | `409 pending_verify` right away, trace marked `failed`, connection closed; every upload error after the token check now closes it |
+| Low | `/status` ran `esp_ota_get_last_invalid_partition()` per request — a full hash and signature check of the other image — and the value vanished once an upload erased that slot | read once at boot from the other slot's otadata state |
+| Low | A CA with a plain `mqtt://` URI: esp-mqtt refuses it with only a warning of its own; each retry at GOT_IP created another publish timer | explicit error in our log, MQTT stays off; topics, defaults and timer are set up once |
+
+Checked on the bridge: the update went `pending_verify` → `valid` on the first
+check; a second upload in the pending minute got `409` within about 2 s (curl then
+reports `Connection reset by peer`, because the bridge closes instead of reading the
+body); a test image built to fail the memory check failed 20 checks with `heap` and
+was back on the previous firmware at 5 minutes, `rolled_back_from: "ota_0"`,
+`/status` in 0.15–0.3 s, MQTT over TLS connected. Not tested on the device: the
+`mqtt://`-with-CA error (it needs a deliberately wrong config).
+
+Still open: a hang that starts **after** an image is confirmed is not reset by
+anything. That would need a watchdog that resets (`CONFIG_ESP_TASK_WDT_PANIC` is
+off) and something that notices a stuck HTTP task; neither exists yet.
 
 ## Limits
 

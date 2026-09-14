@@ -59,8 +59,9 @@ CONFIG_SECURE_BOOT_BUILD_SIGNED_BINARIES=y
 CONFIG_SECURE_BOOT_SIGNING_KEY="secure_boot_signing_key.pem"
 
 # OTA rollback (2026-09-13): a new image boots "pending verify" and is only marked
-# valid once it has run a minute with HTTP up (main.c, confirm_image_cb). A crash
-# before that makes the bootloader start the previous image. Lives in the
+# valid once its own HTTP server answers /status and enough memory is free
+# (http.c, image_check_task; since 2026-09-14). A crash before that, or no success
+# within 5 minutes, makes the device start the previous image. Lives in the
 # bootloader, so switching it on needed one USB flash.
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 

@@ -60,14 +60,36 @@ curl -X POST -H "X-Amaran-Token: $TOKEN" --data-binary @build/amaran_esp32_mesh_
   MQTT runs unencrypted, so whoever can intercept traffic on the network reads the
   password at a reconnect, computes the token and installs any firmware. Now the
   token is random and a stolen token alone is not enough.
-- **Rollback** (since 2026-09-13). A new image boots `pending_verify` and is marked
-  valid only after it has run a minute with the HTTP server up (`image_state` in
-  `/status`). If it crashes before, the bootloader starts the previous image.
+- **Rollback** (since 2026-09-13). A new image boots `pending_verify` and has to
+  pass a check before it is marked valid (`image_state` and `image_check` in
+  `/status`): its own HTTP server must answer `GET /status` with 200 over loopback,
+  and the largest free heap block must be at least 16 KB. First check after a
+  minute, then every 10 s. If it crashes before, the bootloader starts the previous
+  image; if it hasn't passed after 5 minutes of uptime, the firmware marks itself
+  invalid and restarts into the previous image.
   Tested with a signed image that aborted 20 s after boot: the serial log showed
   the crash, the bootloader loaded `0x20000` again, and `/status` reported
   `rolled_back_from: "ota_1"` with the previous firmware's ELF hash. The rollback
   logic lives in the bootloader, so switching it on took one USB flash
   (`idf.py -p <port> flash` — the mesh provisioning in NVS stays).
+- **Until 2026-09-14 one minute of uptime was the whole check.** A review found
+  the gap: the task watchdog only logs (`CONFIG_ESP_TASK_WDT_PANIC` is off), so an
+  image with a hung HTTP task or leaking memory would have been confirmed — and
+  then the next upload would have needed the cable. Checked on 2026-09-14: the
+  update confirmed on the first check (`stack_free` 6212 of 8192 bytes); a test
+  image built to fail the memory check reported `last_error: "heap"` 20 times and
+  was back on the previous firmware at 5 minutes, with
+  `rolled_back_from: "ota_0"`, MQTT over TLS reconnected and `/status` answering in
+  0.15–0.3 s. Limit: a hang that starts after the image is confirmed is still not
+  reset by anything.
+- **No upload while `pending_verify`.** ESP-IDF refuses to start an update before
+  the running image is confirmed, so `POST /ota` answers `409`
+  `{"ok":false,"error":"pending_verify"}` — wait for `image_state: "valid"`. The
+  bridge closes the connection instead of reading the body first, so curl reports
+  `http=409` within about 2 s but usually ends with `Connection reset by peer`
+  (exit 56), with or without `Expect: 100-continue`; the JSON body may not arrive.
+  Until 2026-09-14 this was a 500 `ota begin` after the whole image had been sent.
+  All other upload errors close the connection the same way.
 - `esp_ota_end` verifies the image **before** the boot partition switches; an
   aborted upload never boots half an image. The device then starts from the other
   partition (`ota_0` <-> `ota_1`).
@@ -156,7 +178,7 @@ $EDITOR main/wifi_config.h
 |---|---|
 | `WIFI_SSID` / `WIFI_PASSWORD` | Your 2.4 GHz network |
 | `MQTT_URI` | e.g. `mqtts://192.168.1.10:8883` with TLS, or `mqtt://192.168.1.10:1883` without (the broker's IP is more reliable than mDNS on ESP32) |
-| `MQTT_CA_CERT` | CA certificate for `mqtts://`, see [MQTT over TLS](#mqtt-over-tls); `""` = plain MQTT |
+| `MQTT_CA_CERT` | CA certificate for `mqtts://`, see [MQTT over TLS](#mqtt-over-tls); `""` = plain MQTT. A CA with a plain `mqtt://` URI is refused: MQTT stays off and the serial log says why |
 | `MQTT_USERNAME` / `MQTT_PASSWORD` | Broker login, or `""` for anonymous |
 | `HA_DISCOVERY_PREFIX` | Leave `homeassistant` unless changed in HA |
 | `MQTT_TOPIC_PREFIX` | `amaran` → topics like `amaran/key_light/set` |
@@ -288,9 +310,13 @@ name in `host_allowed()` in `main/http.c`. Refused requests get `403`.
 - `onoff` — in which round an on/off got confirmed. Many round-2/3 entries or
   `not_confirmed` mean the fixture hears the bridge badly; note that "off" to a
   lit Verge Max was the hard case.
-- `image_state` / `rolled_back_from` — `pending_verify` for the first minute after
-  an update, then `valid` (`untracked` after a USB flash); `rolled_back_from` names
-  the partition the bootloader gave up on.
+- `image_state` / `image_check` / `rolled_back_from` — `pending_verify` after an
+  update until the image check passes (at the earliest after a minute), then
+  `valid` (`untracked` after a USB flash). `image_check` is there only when this
+  boot started unconfirmed: `checks` so far, `last_error` (`null` when the last one
+  passed; otherwise `http no answer`, `http status`, `heap`, `mark valid` or
+  `rollback failed`), and `stack_free` once it is done. `rolled_back_from` names
+  the partition the bootloader gave up on; it is read once at boot.
 - `largest_free_block` — the largest single allocation that would fit. TLS needs
   contiguous memory, so this matters more than `free_heap` alone.
 - `wifi.reconnects` / `mqtt_connects` — Wi-Fi reconnects since boot and MQTT

@@ -18,7 +18,6 @@
 
 #include "driver/uart.h"
 #include "esp_log.h"
-#include "esp_ota_ops.h"
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -641,30 +640,6 @@ static const amaran_mqtt_dispatch_t g_dispatch = {
     .refresh = disp_refresh,
 };
 
-/* OTA rollback (CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE, since 2026-09-13). A new
- * image boots "pending verify" and has to prove itself: the HTTP server — the
- * way to the next update — must be up, and the device must stay alive for a
- * minute after that. Only then is the image marked valid. If it crashes or a
- * watchdog resets it before, the bootloader starts the previous image instead of
- * looping on the broken one until someone brings a USB cable. */
-#define IMAGE_CONFIRM_DELAY_US (60LL * 1000 * 1000)
-static esp_timer_handle_t s_confirm_timer;
-
-static void confirm_image_cb(void *arg)
-{
-    const esp_partition_t *running = esp_ota_get_running_partition();
-    esp_ota_img_states_t state;
-    if (!running || esp_ota_get_state_partition(running, &state) != ESP_OK
-        || state != ESP_OTA_IMG_PENDING_VERIFY) {
-        return;                       /* flashed over USB, or already confirmed */
-    }
-    if (esp_ota_mark_app_valid_cancel_rollback() == ESP_OK) {
-        ESP_LOGI(TAG, "image on %s confirmed, rollback cancelled", running->label);
-    } else {
-        ESP_LOGE(TAG, "could not confirm image on %s", running->label);
-    }
-}
-
 static void on_wifi_ip(void)
 {
     /* Called on EVERY IP_EVENT_STA_GOT_IP — also after each Wi-Fi reconnect,
@@ -686,12 +661,6 @@ static void on_wifi_ip(void)
      * without starting the other one twice. */
     if (!mqtt_started) mqtt_started = amaran_mqtt_start(&g_dispatch) == 0;
     if (!http_started) http_started = amaran_http_start(&g_dispatch) == 0;
-    if (http_started && !s_confirm_timer) {
-        const esp_timer_create_args_t args = { .callback = confirm_image_cb, .name = "amaran_confirm" };
-        if (esp_timer_create(&args, &s_confirm_timer) == ESP_OK) {
-            esp_timer_start_once(s_confirm_timer, IMAGE_CONFIRM_DELAY_US);
-        }
-    }
 }
 
 static int send_telink_to(uint16_t dst, const uint8_t payload[10])
@@ -937,6 +906,10 @@ void app_main(void)
 
     xTaskCreate(uart_task, "uart_cli", 4096, NULL, 5, NULL);
     xTaskCreate(poll_task, "amaran_poll", 3072, NULL, 4, NULL);
+
+    /* After an OTA: confirm the new image once its HTTP server answers, or roll
+     * back (http.c). */
+    amaran_image_check_start();
 
     /* Bring up Wi-Fi; MQTT + HTTP start from the got-IP callback. Wi-Fi
      * coexists with BLE on the same chip via the software-coex layer

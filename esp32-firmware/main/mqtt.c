@@ -466,35 +466,51 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
 #define MQTT_CA_CERT ""
 #endif
 
+/* The schemes esp-mqtt runs over TLS. */
+static bool uri_is_tls(void)
+{
+    return strncmp(MQTT_URI, "mqtts://", 8) == 0 || strncmp(MQTT_URI, "wss://", 6) == 0;
+}
+
 int amaran_mqtt_start(const amaran_mqtt_dispatch_t *dispatch)
 {
     s_dispatch = dispatch;
 
-    for (int i = 0; i < AMARAN_LIGHT_COUNT; i++) {
-        snprintf(s_topics[i].set_topic, sizeof(s_topics[i].set_topic),
-                 "%s/%s/set", MQTT_TOPIC_PREFIX, AMARAN_LIGHTS[i].key);
-        snprintf(s_topics[i].state_topic, sizeof(s_topics[i].state_topic),
-                 "%s/%s/state", MQTT_TOPIC_PREFIX, AMARAN_LIGHTS[i].key);
-        snprintf(s_topics[i].gm_set_topic, sizeof(s_topics[i].gm_set_topic),
-                 "%s/%s/gm/set", MQTT_TOPIC_PREFIX, AMARAN_LIGHTS[i].key);
-        snprintf(s_topics[i].gm_state_topic, sizeof(s_topics[i].gm_state_topic),
-                 "%s/%s/gm/state", MQTT_TOPIC_PREFIX, AMARAN_LIGHTS[i].key);
-        s_state[i].on = false;
-        s_state[i].brightness = 100;
-        s_state[i].color_temp_k = 4700;
-        s_state[i].color_temp_mired = 1000000 / 4700;
-        s_state[i].hue = 0;
-        s_state[i].sat = 0;
-        s_state[i].gm = 0;
-        s_state[i].is_hs = false;   /* start in CCT mode */
-        s_state[i].dirty = false;
+    /* main.c tries a failed start again at every GOT_IP. Topics, defaults and
+     * the publish timer are set up only the first time: each retry used to
+     * create another timer, and the defaults overwrote state the mesh had
+     * reported in the meantime. */
+    static bool prepared;
+    if (!prepared) {
+        for (int i = 0; i < AMARAN_LIGHT_COUNT; i++) {
+            snprintf(s_topics[i].set_topic, sizeof(s_topics[i].set_topic),
+                     "%s/%s/set", MQTT_TOPIC_PREFIX, AMARAN_LIGHTS[i].key);
+            snprintf(s_topics[i].state_topic, sizeof(s_topics[i].state_topic),
+                     "%s/%s/state", MQTT_TOPIC_PREFIX, AMARAN_LIGHTS[i].key);
+            snprintf(s_topics[i].gm_set_topic, sizeof(s_topics[i].gm_set_topic),
+                     "%s/%s/gm/set", MQTT_TOPIC_PREFIX, AMARAN_LIGHTS[i].key);
+            snprintf(s_topics[i].gm_state_topic, sizeof(s_topics[i].gm_state_topic),
+                     "%s/%s/gm/state", MQTT_TOPIC_PREFIX, AMARAN_LIGHTS[i].key);
+            s_state[i].on = false;
+            s_state[i].brightness = 100;
+            s_state[i].color_temp_k = 4700;
+            s_state[i].color_temp_mired = 1000000 / 4700;
+            s_state[i].hue = 0;
+            s_state[i].sat = 0;
+            s_state[i].gm = 0;
+            s_state[i].is_hs = false;   /* start in CCT mode */
+            s_state[i].dirty = false;
+        }
+        prepared = true;
     }
 
-    const esp_timer_create_args_t pub_args = {
-        .callback = publish_flush_cb,
-        .name = "amaran_mqtt_pub",
-    };
-    esp_timer_create(&pub_args, &s_publish_timer);
+    if (!s_publish_timer) {
+        const esp_timer_create_args_t pub_args = {
+            .callback = publish_flush_cb,
+            .name = "amaran_mqtt_pub",
+        };
+        esp_timer_create(&pub_args, &s_publish_timer);
+    }
 
     esp_mqtt_client_config_t cfg = {
         .broker.address.uri = MQTT_URI,
@@ -505,8 +521,15 @@ int amaran_mqtt_start(const amaran_mqtt_dispatch_t *dispatch)
      * TLS buffers are allocated dynamically (sdkconfig.defaults) — with the
      * defaults a firmware upload during a TLS session left 2.2 KB of heap. */
     if (sizeof(MQTT_CA_CERT) > 1) {
+        if (!uri_is_tls()) {
+            /* esp-mqtt refuses the combination: esp_mqtt_client_init returns NULL
+             * with only a warning of its own. Don't fall back to plain MQTT —
+             * a CA means the password is not meant to travel unencrypted. */
+            ESP_LOGE(TAG, "MQTT_CA_CERT is set but MQTT_URI is not mqtts:// (or wss://) — MQTT stays off");
+            return -1;
+        }
         cfg.broker.verification.certificate = MQTT_CA_CERT;
-    } else if (strncmp(MQTT_URI, "mqtts://", 8) == 0) {
+    } else if (uri_is_tls()) {
         ESP_LOGE(TAG, "MQTT_URI is mqtts:// but MQTT_CA_CERT is empty — the broker cannot be verified");
     }
     if (strlen(MQTT_USERNAME) > 0) {
@@ -524,7 +547,7 @@ int amaran_mqtt_start(const amaran_mqtt_dispatch_t *dispatch)
 
 bool amaran_mqtt_tls(void)
 {
-    return strncmp(MQTT_URI, "mqtts://", 8) == 0;
+    return uri_is_tls();
 }
 
 uint32_t amaran_mqtt_connects(void)

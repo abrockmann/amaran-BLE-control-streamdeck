@@ -23,6 +23,11 @@ extern "C" {
 
 int amaran_http_start(const amaran_mqtt_dispatch_t *dispatch);
 
+/* Call once at boot. Notes whether the bootloader rolled back, and for an image
+ * that is still pending_verify starts the check that confirms it — or rolls it
+ * back if it hasn't passed within 5 minutes. */
+void amaran_image_check_start(void);
+
 /* Diagnostics for GET /status, kept by main.c. They exist so the bridge's
  * placement can be judged without a USB cable: Wi-Fi signal comes from the
  * driver, Bluetooth reach from these counters. */
