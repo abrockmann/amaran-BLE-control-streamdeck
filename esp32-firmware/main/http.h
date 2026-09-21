@@ -25,7 +25,9 @@ int amaran_http_start(const amaran_mqtt_dispatch_t *dispatch);
 
 /* Call once at boot. Notes whether the bootloader rolled back, and for an image
  * that is still pending_verify starts the check that confirms it — or rolls it
- * back if it hasn't passed within 5 minutes. */
+ * back if it hasn't passed within 5 minutes. After that (and right away for a
+ * confirmed image) the same check runs once a minute as a watchdog: three
+ * failures in a row restart the bridge, recorded in GET /status. */
 void amaran_image_check_start(void);
 
 /* Diagnostics for GET /status, kept by main.c. They exist so the bridge's

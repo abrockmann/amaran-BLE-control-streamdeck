@@ -80,8 +80,35 @@ curl -X POST -H "X-Amaran-Token: $TOKEN" --data-binary @build/amaran_esp32_mesh_
   image built to fail the memory check reported `last_error: "heap"` 20 times and
   was back on the previous firmware at 5 minutes, with
   `rolled_back_from: "ota_0"`, MQTT over TLS reconnected and `/status` answering in
-  0.15–0.3 s. Limit: a hang that starts after the image is confirmed is still not
-  reset by anything.
+  0.15–0.3 s. A hang that starts after the image is confirmed is covered since
+  2026-09-21 by the health watchdog (next point).
+- **Health watchdog** (since 2026-09-21). A second task runs the same check once a
+  minute for the whole uptime; three failures in a row restart the bridge. It gives
+  no verdict while an upload holds the HTTP task (for at most 5 minutes), and it has
+  to have run once before a new image is confirmed, so a fault in it still rolls
+  back. Backoff: when a failure streak begins within an hour of a boot, each such
+  restart in a row doubles the failures needed (3, 6, 12 … 96); a streak that begins
+  after a healthy hour always restarts after 3. What failed, with the heap and socket
+  figures of that moment, survives the restart in RTC memory (`health.last_restart`
+  in `/status`; power loss clears it). Checked on the bridge on 2026-09-21 with two throwaway test images. One whose
+  watchdog check always failed restarted after three checks (~4 minutes of uptime),
+  `reset_reason: "software"`, record intact. One whose watchdog checked a closed
+  port (the real failure path) failed while pending without holding up the
+  confirmation, then restarted after three failures with `http_client:
+  "ESP_ERR_HTTP_CONNECT"`, `errno` 104 and 1656 of 4096 bytes of stack left — the
+  task has 5 KB since. The released build: watchdog's first check at 45 s, image
+  confirmed on its first check at 60 s, about 2 KB of the 5 KB in use, ~66 KB free
+  heap.
+- **Socket pool** (since 2026-09-21). That morning the bridge reset every HTTP
+  connection — `/status`, `/lights`, even unknown paths — until it was
+  power-cycled. lwIP's socket pool (default 10) ran out while the HTTP server still
+  had free session slots, and the server drops its least recently used session only
+  when all 7 are taken, so `accept()` failed and lwIP reset each new connection.
+  Holding 4 idle connections reproduced it. Now `CONFIG_LWIP_MAX_SOCKETS=16` with 7
+  sessions (a compile-time check in `main/http.c` keeps the pool large enough), and
+  TCP keep-alive closes sessions whose client vanished (after ~90 s). Checked on the
+  bridge: with 10 idle connections held every new request still got 200; sessions
+  stayed at 7 and sockets at 11 of 16.
 - **No upload while `pending_verify`.** ESP-IDF refuses to start an update before
   the running image is confirmed, so `POST /ota` answers `409`
   `{"ok":false,"error":"pending_verify"}` — wait for `image_state: "valid"`. The
@@ -314,9 +341,21 @@ name in `host_allowed()` in `main/http.c`. Refused requests get `403`.
   update until the image check passes (at the earliest after a minute), then
   `valid` (`untracked` after a USB flash). `image_check` is there only when this
   boot started unconfirmed: `checks` so far, `last_error` (`null` when the last one
-  passed; otherwise `http no answer`, `http status`, `heap`, `mark valid` or
-  `rollback failed`), and `stack_free` once it is done. `rolled_back_from` names
+  passed; otherwise `http no answer`, `http status`, `heap`, `http client`,
+  `watchdog not run`, `mark valid` or `rollback failed`), and `stack_free` once it
+  is done. `rolled_back_from` names
   the partition the bootloader gave up on; it is read once at boot.
+- `sockets` — open lwIP sockets (`open` of `max`) and HTTP sessions
+  (`http_sessions` of `http_sessions_max`). With no other client: 4 sockets (the
+  server's 3 and MQTT) plus one session for the request itself. `open` reaching
+  `max` is the lockout of 2026-09-21.
+- `health` — the watchdog: `checks` with a verdict, `fails_in_row`, `last_error`
+  (values as for `image_check`), `fails_to_restart` (3, more during a backoff),
+  `stack_free` of its task and `restarts` since power-on. After a watchdog restart
+  (`reset_reason: "software"`) `last_restart` holds `uptime_s`, `reason`,
+  `http_client` (the esp_http_client result, `null` if the client couldn't be
+  created), `errno`, `http_status`, the heap figures, `sockets_open`,
+  `http_sessions` and the task's `stack_free` at that moment.
 - `largest_free_block` — the largest single allocation that would fit. TLS needs
   contiguous memory, so this matters more than `free_heap` alone.
 - `wifi.reconnects` / `mqtt_connects` — Wi-Fi reconnects since boot and MQTT

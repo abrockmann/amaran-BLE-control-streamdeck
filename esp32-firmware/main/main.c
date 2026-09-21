@@ -908,7 +908,7 @@ void app_main(void)
     xTaskCreate(poll_task, "amaran_poll", 3072, NULL, 4, NULL);
 
     /* After an OTA: confirm the new image once its HTTP server answers, or roll
-     * back (http.c). */
+     * back; then watch the HTTP server and restart if it stops answering (http.c). */
     amaran_image_check_start();
 
     /* Bring up Wi-Fi; MQTT + HTTP start from the got-IP callback. Wi-Fi

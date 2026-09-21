@@ -539,9 +539,65 @@ was back on the previous firmware at 5 minutes, `rolled_back_from: "ota_0"`,
 `/status` in 0.15–0.3 s, MQTT over TLS connected. Not tested on the device: the
 `mqtt://`-with-CA error (it needs a deliberately wrong config).
 
-Still open: a hang that starts **after** an image is confirmed is not reset by
-anything. That would need a watchdog that resets (`CONFIG_ESP_TASK_WDT_PANIC` is
-off) and something that notices a stuck HTTP task; neither exists yet.
+A hang that starts **after** an image is confirmed was still not reset by anything —
+until the lockout of 2026-09-21, next section.
+
+## HTTP lockout and health watchdog (2026-09-21)
+
+**What happened.** The Stream Deck dials stopped working one morning: every send
+ended in `read ECONNRESET`. The bridge was on the network (ARP, mDNS, TCP handshake
+on port 80), but reset every request within ~80 ms — `/status`, `/lights`, even a
+path that doesn't exist, so no handler ran at all. Nothing on the bridge noticed;
+it took a power-cycle.
+
+**Cause.** lwIP has one socket pool for everything (`CONFIG_LWIP_MAX_SOCKETS`,
+default 10). The HTTP server holds up to 7 sessions plus 3 sockets of its own, MQTT
+one more. The server drops its least recently used session only when **all 7**
+sessions are taken — but the pool ran out first, `accept()` failed and lwIP reset
+each new connection (ESP-IDF v5.3.2, `httpd_accept_conn`). Clients that leave
+connections open (Node keeps them 5 s, a Mac going to sleep leaves them for good)
+were enough. Reproduced right after the power-cycle: holding **4** idle connections
+made every new request reset; closing them brought it back at once.
+
+**Fix.**
+
+- `CONFIG_LWIP_MAX_SOCKETS=16`, `max_open_sockets = 7`, and a compile-time check in
+  `main/http.c` that the sessions plus everything else fit the pool. Measured: with
+  no other client 4 sockets are in use (the server's 3 and MQTT).
+- TCP keep-alive on sessions (60 s idle, 3 × 10 s) closes clients that vanished.
+- A health watchdog: its own task (5 KB) runs the image check (loopback
+  `GET /status` = 200, largest free block ≥ 16 KB) once a minute for the whole
+  uptime; three failures in a row restart the bridge. The cause and the heap and
+  socket figures of that moment survive the restart in RTC memory and show in
+  `/status` (`health.last_restart`), so a restart can't quietly hide a leak.
+- `/status` shows `sockets` (open, sessions) and `health`.
+
+**Two independent reviews** of the change found, among others:
+
+| Severity | Finding | Fix |
+| --- | --- | --- |
+| Medium | The watchdog kept the image check's 8 KB stack for the whole uptime | own task with 5 KB (a check needs ~2 KB, a failing one ~2.4 KB); the image check is unchanged again and frees its 8 KB after confirmation. The watchdog starts at boot and must have run once before an image is confirmed, so a fault in it still rolls back |
+| Medium | Backoff (added by the builder) never decayed: after five restarts every lockout would have taken ~1.5 h to clear | backoff only for a failure streak that begins within an hour of a boot; a streak after a healthy hour restarts after 3 failures |
+| Low | A check running when an upload began counted as a failure — a restart mid-upload was possible | generation counter: no verdict if an upload began during the check; a hung upload holds the watchdog off for at most 5 minutes |
+| Low | A late HTTP server could run into the 5-minute rollback deadline, waiting for the watchdog's next turn | the image check wakes the watchdog (task notification) |
+| Low | The RTC record changed layout under the same magic: fields read shifted after an update | the record's size is part of the magic |
+| Low | `http_client: "ESP_OK"` for a check whose client was never created; two checks could run at once while pending | `null` plus the HTTP status; one check at a time (mutex) |
+
+**Checked on the bridge.** Before the fix, holding 4 idle connections locked every
+client out. After it, with 10 held, every new request got 200; the server stayed at
+7 sessions and 11 of 16 sockets, and dropped the older idle connections. Two
+throwaway test images proved the watchdog: one whose check always failed restarted
+after three checks (`reset_reason: "software"`, record intact); one whose watchdog
+checked a closed port — the real failure path — failed while pending without holding
+up the confirmation, then restarted with `ESP_ERR_HTTP_CONNECT`, errno 104, and
+1656 of 4096 bytes of stack left (the task has 5 KB since). The new magic dropped
+the previous layout's record, and the next boot showed `fails_to_restart: 6` — the
+backoff after a restart early in a boot, back to 3 after an hour of uptime or at
+power-on. The released build confirmed on its first check after the
+watchdog had run at 45 s; free heap ~66 KB, largest block 49 KB.
+
+Not covered: if `httpd_start` itself fails, the watchdog never arms (it waits for
+the server), and the next start attempt comes with the next Wi-Fi reconnect.
 
 ## Limits
 

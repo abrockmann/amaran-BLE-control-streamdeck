@@ -1,5 +1,6 @@
 #include "http.h"
 
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +18,7 @@
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "lwip/sockets.h"   /* inet_pton, AF_INET */
 
@@ -57,6 +59,53 @@ static void ota_trace(uint32_t stage, uint32_t bytes)
 
 static const amaran_mqtt_dispatch_t *s_dispatch;
 static httpd_handle_t s_server;
+/* An upload holds the single HTTP task for ~20 s; the health watchdog gives no
+ * verdict meanwhile. The counter catches an upload that begins during a check;
+ * the time limit keeps a hung upload from switching the watchdog off for good. */
+static volatile bool s_ota_busy;
+static volatile uint32_t s_ota_gen;
+static volatile int64_t s_ota_since_us;
+#define OTA_BUSY_MAX_US (5LL * 60 * 1000 * 1000)
+
+static bool ota_holds_http(void)
+{
+    return s_ota_busy && esp_timer_get_time() - s_ota_since_us < OTA_BUSY_MAX_US;
+}
+
+/* ---- sockets ----------------------------------------------------------------
+ * One lwIP pool (CONFIG_LWIP_MAX_SOCKETS) serves the HTTP sessions and every
+ * other socket. The server purges its least recently used session only once all
+ * max_open_sockets sessions are taken; if the pool runs out first, accept()
+ * fails and lwIP resets each new connection. With the defaults (pool 10,
+ * 7 sessions) that happened on 2026-09-21: the bridge reset every request —
+ * /status, /lights, even an unknown path — until it was power-cycled.
+ * Reproduced on the device by holding 4 idle connections; closing them brought
+ * it back at once. So the pool must hold all sessions plus everything else. */
+#define HTTP_MAX_SESSIONS 7
+/* Not sessions: the server's own 3 (listen socket + control pair), MQTT, the
+ * health check's loopback client, and a reserve of 4 for what isn't listed. */
+#define SOCKETS_OUTSIDE_SESSIONS (3 + 1 + 1 + 4)
+#if CONFIG_LWIP_MAX_SOCKETS < HTTP_MAX_SESSIONS + SOCKETS_OUTSIDE_SESSIONS
+#error "CONFIG_LWIP_MAX_SOCKETS must hold all HTTP sessions plus the other sockets (see http.c)"
+#endif
+
+/* Open lwIP sockets, for GET /status: fcntl() fails with EBADF on a free slot. */
+static int sockets_open(void)
+{
+    int n = 0;
+    for (int fd = LWIP_SOCKET_OFFSET; fd < LWIP_SOCKET_OFFSET + CONFIG_LWIP_MAX_SOCKETS; fd++) {
+        if (fcntl(fd, F_GETFL, 0) >= 0) n++;
+    }
+    return n;
+}
+
+static int http_sessions(void)
+{
+    if (!s_server) return 0;
+    int fds[HTTP_MAX_SESSIONS];
+    size_t n = HTTP_MAX_SESSIONS;
+    return httpd_get_client_list(s_server, &n, fds) == ESP_OK ? (int)n : -1;
+}
 
 /* "all" / "broadcast" / "" → group address. Otherwise match a fixture key
  * or decimal/hex address. Returns 0 on hit, -1 on no match. */
@@ -276,17 +325,83 @@ static struct {
  * returned NULL as soon as the next upload had erased the slot. */
 static const char *s_rolled_back_from;
 
-static const char *image_check_once(void)
+/* ---- health watchdog (since 2026-09-21) --------------------------------------
+ * The image check above runs only until an image is confirmed. On 2026-09-21 the
+ * bridge stopped answering HTTP and stayed that way until someone pulled the plug;
+ * nothing on the bridge noticed. A second task now runs the same check once a
+ * minute for the whole uptime, and three failures in a row restart the bridge.
+ * What failed and the heap and socket figures of that moment survive the restart
+ * (RTC memory; power loss clears them) and appear in GET /status under
+ * health.last_restart, so a restart shows up instead of hiding a leak.
+ * - Own 5 KB stack: a passing check needs ~2 KB, a failing one plus the restart
+ *   record ~2.4 KB (1656 of 4096 left, measured on 2026-09-21), and esp_restart's
+ *   shutdown handlers run on it too. The image check's 8 KB are freed after
+ *   confirmation as before.
+ * - Starts at boot and has to run once before an image is confirmed, so a fault
+ *   in it still rolls back. While an image is pending, only the image check acts.
+ * - Backoff only for a failure streak that begins within an hour of a boot: each
+ *   restart in a row of such restarts doubles the failures needed (3, 6, 12 … up
+ *   to 96), so a fault a restart doesn't cure restarts the bridge about every
+ *   1.5 h instead of every 4 minutes. A streak that begins after an hour of
+ *   uptime always restarts after 3 failures and starts the row anew.
+ * - One check at a time (mutex): while an image is pending both tasks check, and
+ *   the socket budget counts one loopback client. */
+#define HEALTH_FIRST_MS       45000   /* before the image check's first, at 60 s */
+#define HEALTH_INTERVAL_MS    60000
+#define HEALTH_FAILS_RESTART  3
+#define HEALTH_BACKOFF_MAX    5
+#define HEALTH_BACKOFF_WINDOW_US (60LL * 60 * 1000 * 1000)
+#define HEALTH_STACK          5120
+#define CHECK_NOT_RUN         INT32_MIN   /* the HTTP client could not be created */
+
+typedef struct {
+    uint32_t magic;
+    uint32_t restarts;          /* watchdog restarts since power-on */
+    uint32_t backoff;           /* restarts in a row whose streak began early */
+    uint32_t uptime_s;          /* the rest describes the last one */
+    char     reason[16];
+    int32_t  err;               /* esp_http_client_perform result, or CHECK_NOT_RUN */
+    int32_t  sock_errno;
+    int32_t  http_status;
+    uint32_t free_heap, min_free_heap, largest_block;
+    int32_t  sockets_open, http_sessions;
+    uint32_t stack_free;        /* watchdog task, after the failed checks */
+} health_record_t;
+RTC_NOINIT_ATTR static health_record_t s_health_rec;
+/* The size is part of the magic: a record another layout wrote is dropped. */
+#define HEALTH_MAGIC          (0x4EA17D00u ^ (uint32_t)sizeof(health_record_t))
+
+static struct {
+    uint32_t checks;            /* checks with a verdict */
+    uint32_t fails_in_row;
+    int64_t  streak_start_us;   /* uptime at the first failure of the streak */
+    const char *last_error;
+} s_health;
+static TaskHandle_t s_health_task;
+static SemaphoreHandle_t s_check_lock;
+static volatile bool s_image_pending;
+
+/* The last check's client result, for the restart record. */
+static int32_t s_check_err;
+static int s_check_errno;
+static int s_check_status;
+
+static const char *image_check_once_locked(void)
 {
     char url[40];
     snprintf(url, sizeof(url), "http://127.0.0.1:%d/status", HTTP_PORT);
     const esp_http_client_config_t cfg = { .url = url, .timeout_ms = 5000 };
+    s_check_err = CHECK_NOT_RUN;
+    s_check_errno = 0;
+    s_check_status = 0;
     esp_http_client_handle_t c = esp_http_client_init(&cfg);
     if (!c) return "http client";
     const char *err = NULL;
-    if (esp_http_client_perform(c) != ESP_OK) {
+    s_check_err = esp_http_client_perform(c);
+    if (s_check_err != ESP_OK) {
+        s_check_errno = esp_http_client_get_errno(c);
         err = "http no answer";
-    } else if (esp_http_client_get_status_code(c) != 200) {
+    } else if ((s_check_status = esp_http_client_get_status_code(c)) != 200) {
         err = "http status";
     }
     esp_http_client_cleanup(c);
@@ -295,6 +410,71 @@ static const char *image_check_once(void)
         return "heap";
     }
     return NULL;
+}
+
+static const char *image_check_once(void)
+{
+    if (s_check_lock) xSemaphoreTake(s_check_lock, portMAX_DELAY);
+    const char *err = image_check_once_locked();
+    if (s_check_lock) xSemaphoreGive(s_check_lock);
+    return err;
+}
+
+/* For the current streak, or for one that began now. */
+static uint32_t health_fails_to_restart(void)
+{
+    int64_t start = s_health.fails_in_row ? s_health.streak_start_us : esp_timer_get_time();
+    if (start >= HEALTH_BACKOFF_WINDOW_US) return HEALTH_FAILS_RESTART;
+    uint32_t n = s_health_rec.backoff < HEALTH_BACKOFF_MAX ? s_health_rec.backoff : HEALTH_BACKOFF_MAX;
+    return HEALTH_FAILS_RESTART << n;
+}
+
+static void health_restart(const char *err)
+{
+    health_record_t *r = &s_health_rec;
+    r->restarts++;
+    r->backoff = s_health.streak_start_us >= HEALTH_BACKOFF_WINDOW_US ? 1 : r->backoff + 1;
+    r->uptime_s = (uint32_t)(esp_timer_get_time() / 1000000);
+    strlcpy(r->reason, err, sizeof(r->reason));
+    r->err = s_check_err;
+    r->sock_errno = s_check_errno;
+    r->http_status = s_check_status;
+    r->free_heap = esp_get_free_heap_size();
+    r->min_free_heap = esp_get_minimum_free_heap_size();
+    r->largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    r->sockets_open = sockets_open();
+    r->http_sessions = http_sessions();
+    r->stack_free = uxTaskGetStackHighWaterMark(NULL);
+    ESP_LOGE(TAG, "health check failed %" PRIu32 " times in a row (%s), restarting",
+             s_health.fails_in_row, err);
+    esp_restart();
+}
+
+/* Waits with ulTaskNotifyTake: the image check wakes it early (see there). */
+static void health_task(void *arg)
+{
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(HEALTH_FIRST_MS));
+    for (;;) {
+        uint32_t gen = s_ota_gen;
+        /* Not before the server runs (no Wi-Fi since boot), and no verdict while
+         * an upload holds the HTTP task or began during the check: the check
+         * would time out with nothing wrong. */
+        if (s_server && !ota_holds_http()) {
+            const char *err = image_check_once();
+            if (s_ota_gen == gen && !ota_holds_http()) {
+                s_health.checks++;
+                s_health.last_error = err;
+                if (!err) {
+                    s_health.fails_in_row = 0;
+                } else if (!s_image_pending) {
+                    if (s_health.fails_in_row++ == 0) s_health.streak_start_us = esp_timer_get_time();
+                    ESP_LOGW(TAG, "health check failed (%" PRIu32 " in a row): %s", s_health.fails_in_row, err);
+                    if (s_health.fails_in_row >= health_fails_to_restart()) health_restart(err);
+                }
+            }
+        }
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(HEALTH_INTERVAL_MS));
+    }
 }
 
 static void image_check_task(void *arg)
@@ -307,8 +487,16 @@ static void image_check_task(void *arg)
     for (;;) {
         s_image_check.checks++;
         const char *err = image_check_once();
+        /* The watchdog has to have run once on this image (see above). Wake it
+         * instead of waiting up to a minute for its next turn: a server that
+         * came up late would otherwise run into the 5-minute deadline. */
+        if (!err && s_health.checks == 0) {
+            err = "watchdog not run";
+            if (s_health_task) xTaskNotifyGive(s_health_task);
+        }
         if (!err) {
             if (esp_ota_mark_app_valid_cancel_rollback() == ESP_OK) {
+                s_image_pending = false;
                 s_image_check.last_error = NULL;
                 ESP_LOGI(TAG, "image on %s confirmed after %" PRIu32 " check(s)", label, s_image_check.checks);
                 break;
@@ -332,6 +520,12 @@ static void image_check_task(void *arg)
 
 void amaran_image_check_start(void)
 {
+    /* RTC memory is garbage after power-on; trust the record only with the magic. */
+    if (esp_reset_reason() == ESP_RST_POWERON || s_health_rec.magic != HEALTH_MAGIC) {
+        memset(&s_health_rec, 0, sizeof(s_health_rec));
+        s_health_rec.magic = HEALTH_MAGIC;
+    }
+
     const esp_partition_t *running = esp_ota_get_running_partition();
     const esp_partition_t *other = esp_ota_get_next_update_partition(NULL);
     esp_ota_img_states_t state;
@@ -340,8 +534,16 @@ void amaran_image_check_start(void)
         s_rolled_back_from = other->label;
     }
 
-    if (!running || esp_ota_get_state_partition(running, &state) != ESP_OK
-        || state != ESP_OTA_IMG_PENDING_VERIFY) {
+    s_image_pending = running && esp_ota_get_state_partition(running, &state) == ESP_OK
+                      && state == ESP_OTA_IMG_PENDING_VERIFY;
+    s_check_lock = xSemaphoreCreateMutex();   /* NULL: checks just don't serialise */
+    /* Without it a pending image is never confirmed and rolls back — right for an
+     * image that can't spare 5 KB at boot. A confirmed one runs on unwatched. */
+    if (xTaskCreate(health_task, "amaran_health", HEALTH_STACK, NULL, 2, &s_health_task) != pdPASS) {
+        ESP_LOGE(TAG, "no memory for the health watchdog");
+    }
+
+    if (!s_image_pending) {
         return;                       /* flashed over USB, or already confirmed */
     }
     s_image_check.started = true;
@@ -404,6 +606,41 @@ static esp_err_t status_get(httpd_req_t *req)
     cJSON_AddBoolToObject(root, "mqtt_connected", amaran_mqtt_is_connected());
     cJSON_AddNumberToObject(root, "mqtt_connects", amaran_mqtt_connects());
     cJSON_AddBoolToObject(root, "mqtt_tls", amaran_mqtt_tls());
+
+    /* This request is one of the sessions. */
+    cJSON *sock = cJSON_AddObjectToObject(root, "sockets");
+    cJSON_AddNumberToObject(sock, "open", sockets_open());
+    cJSON_AddNumberToObject(sock, "max", CONFIG_LWIP_MAX_SOCKETS);
+    cJSON_AddNumberToObject(sock, "http_sessions", http_sessions());
+    cJSON_AddNumberToObject(sock, "http_sessions_max", HTTP_MAX_SESSIONS);
+
+    cJSON *health = cJSON_AddObjectToObject(root, "health");
+    cJSON_AddNumberToObject(health, "checks", s_health.checks);
+    cJSON_AddNumberToObject(health, "fails_in_row", s_health.fails_in_row);
+    cJSON_AddNumberToObject(health, "fails_to_restart", health_fails_to_restart());
+    if (s_health.last_error) cJSON_AddStringToObject(health, "last_error", s_health.last_error);
+    else cJSON_AddNullToObject(health, "last_error");
+    if (s_health_task) cJSON_AddNumberToObject(health, "stack_free", uxTaskGetStackHighWaterMark(s_health_task));
+    cJSON_AddNumberToObject(health, "restarts", s_health_rec.restarts);
+    if (s_health_rec.restarts) {
+        const health_record_t *r = &s_health_rec;
+        cJSON *last = cJSON_AddObjectToObject(health, "last_restart");
+        cJSON_AddNumberToObject(last, "uptime_s", r->uptime_s);
+        char reason[sizeof(r->reason) + 1];
+        memcpy(reason, r->reason, sizeof(r->reason));
+        reason[sizeof(r->reason)] = '\0';
+        cJSON_AddStringToObject(last, "reason", reason);
+        if (r->err == CHECK_NOT_RUN) cJSON_AddNullToObject(last, "http_client");
+        else cJSON_AddStringToObject(last, "http_client", esp_err_to_name(r->err));
+        cJSON_AddNumberToObject(last, "errno", r->sock_errno);
+        cJSON_AddNumberToObject(last, "http_status", r->http_status);
+        cJSON_AddNumberToObject(last, "free_heap", r->free_heap);
+        cJSON_AddNumberToObject(last, "min_free_heap", r->min_free_heap);
+        cJSON_AddNumberToObject(last, "largest_free_block", r->largest_block);
+        cJSON_AddNumberToObject(last, "sockets_open", r->sockets_open);
+        cJSON_AddNumberToObject(last, "http_sessions", r->http_sessions);
+        cJSON_AddNumberToObject(last, "stack_free", r->stack_free);
+    }
 
     /* RTC memory is garbage after power-on; trust it only with the magic. */
     if (s_ota_magic == OTA_TRACE_MAGIC && esp_reset_reason() != ESP_RST_POWERON) {
@@ -597,6 +834,7 @@ static esp_err_t lights_post(httpd_req_t *req)
 static esp_err_t ota_fail(httpd_req_t *req, const char *status, const char *error, int bytes)
 {
     ota_trace(OTA_STAGE_FAILED, bytes);
+    s_ota_busy = false;
     httpd_resp_set_status(req, status);
     httpd_resp_set_type(req, "application/json");
     char body[64];
@@ -626,6 +864,9 @@ static esp_err_t ota_post(httpd_req_t *req)
     }
 
     ota_trace(OTA_STAGE_BEGIN, 0);
+    s_ota_since_us = esp_timer_get_time();
+    s_ota_gen++;
+    s_ota_busy = true;   /* every failure below goes through ota_fail; success restarts */
     /* While the running image is still unconfirmed, esp_ota_begin refuses with
      * ESP_ERR_OTA_ROLLBACK_INVALID_STATE. Until 2026-09-14 that came back as a
      * 500 "ota begin" — after the whole body had been read. */
@@ -704,6 +945,13 @@ int amaran_http_start(const amaran_mqtt_dispatch_t *dispatch)
      * client out, OTA included; purging the least recently used one lets a new
      * request in. */
     cfg.lru_purge_enable = true;
+    cfg.max_open_sockets = HTTP_MAX_SESSIONS;   /* fits the socket pool, see top of file */
+    /* A client that vanished without closing (a Mac going to sleep) keeps its
+     * session until the purge; TCP keep-alive closes it after ~90 s instead. */
+    cfg.keep_alive_enable = true;
+    cfg.keep_alive_idle = 60;
+    cfg.keep_alive_interval = 10;
+    cfg.keep_alive_count = 3;
     cfg.server_port = HTTP_PORT;
     cfg.uri_match_fn = httpd_uri_match_wildcard;
 
