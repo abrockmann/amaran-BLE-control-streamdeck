@@ -167,8 +167,8 @@ the defaults (100 %, 4700 K) there until it is switched on once. For "off", only
 #    it expects them from the system. Without them idf.py stops with
 #    '"cmake" must be available on the PATH'. To add them without Homebrew:
 #        python3 $IDF_PATH/tools/idf_tools.py install cmake ninja
-#    Use exactly v5.3.2: the core patch in patches/ is tested against it
-#    (applied cleanly on 2026-09-11).
+#    Use exactly v5.3.2: the core patches in patches/ are tested against it
+#    (0001 applied cleanly on 2026-09-11, 0002 on 2026-09-28).
 . ~/esp/esp-idf/export.sh
 
 # 2. Generate esp32-firmware/main/mesh_config.h from the amaran Desktop DB.
@@ -437,6 +437,12 @@ Inbound (lights → HA) — the status snoop:
 > your ESP-IDF checkout. Without it, the firmware still builds and the
 > outbound direction works, but HA won't reflect external changes (the weak
 > hook is never called).
+>
+> **Also important:** IDF v5.3.2 has a race in the BLE Mesh advertising
+> buffer pool that makes the mesh go deaf after roughly a week of uptime
+> (sends fail with `-ENOBUFS`; HTTP, heap and Wi-Fi look fine, so the health
+> watchdog does not catch it). `patches/0002` backports Espressif's fix.
+> Apply both patches; see [`patches/README.md`](patches/README.md).
 
 ### Debugging the snoop
 
@@ -457,7 +463,7 @@ esp32-firmware/
 ├── CMakeLists.txt
 ├── sdkconfig.defaults          Bluedroid + BLE Mesh + Wi-Fi + HTTP + MQTT, 4 MB flash
 ├── partitions.csv              3 MB factory app partition
-├── patches/                    ESP-IDF core patch for the inbound status snoop (required)
+├── patches/                    ESP-IDF core patches: status snoop + adv-pool race fix (both required)
 └── main/
     ├── main.c                  app_main, mesh self-provision, dispatch, UART REPL, poll
     ├── mesh_config.h           generated; KEY-BEARING; .gitignore'd
