@@ -1,5 +1,5 @@
 diff --git a/components/bt/esp_ble_mesh/core/adv.c b/components/bt/esp_ble_mesh/core/adv.c
-index 79932a0582..9f0c6c905d 100644
+index 79932a0582..3ffd9b5ae2 100644
 --- a/components/bt/esp_ble_mesh/core/adv.c
 +++ b/components/bt/esp_ble_mesh/core/adv.c
 @@ -59,6 +59,17 @@ struct bt_mesh_queue {
@@ -47,3 +47,11 @@ index 79932a0582..9f0c6c905d 100644
  }
  
  #if CONFIG_BLE_MESH_DEINIT
+@@ -725,6 +740,7 @@ void bt_mesh_adv_deinit(void)
+ #if CONFIG_BLE_MESH_SUPPORT_BLE_ADV
+     bt_mesh_ble_adv_deinit();
+ #endif /* CONFIG_BLE_MESH_SUPPORT_BLE_ADV */
++    bt_mesh_r_mutex_free(&adv_buf_alloc_lock);
+ }
+ #endif /* CONFIG_BLE_MESH_DEINIT */
+ 
