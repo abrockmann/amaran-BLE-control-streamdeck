@@ -341,9 +341,9 @@ name in `host_allowed()` in `main/http.c`. Refused requests get `403`.
   update until the image check passes (at the earliest after a minute), then
   `valid` (`untracked` after a USB flash). `image_check` is there only when this
   boot started unconfirmed: `checks` so far, `last_error` (`null` when the last one
-  passed; otherwise `http no answer`, `http status`, `heap`, `http client`,
-  `watchdog not run`, `mark valid` or `rollback failed`), and `stack_free` once it
-  is done. `rolled_back_from` names
+  passed; otherwise `http no answer`, `http status`, `heap`, `mesh adv pool`,
+  `http client`, `watchdog not run`, `mark valid` or `rollback failed`), and
+  `stack_free` once it is done. `rolled_back_from` names
   the partition the bootloader gave up on; it is read once at boot.
 - `sockets` — open lwIP sockets (`open` of `max`) and HTTP sessions
   (`http_sessions` of `http_sessions_max`). With no other client: 4 sockets (the
@@ -355,7 +355,21 @@ name in `host_allowed()` in `main/http.c`. Refused requests get `403`.
   (`reset_reason: "software"`) `last_restart` holds `uptime_s`, `reason`,
   `http_client` (the esp_http_client result, `null` if the client couldn't be
   created), `errno`, `http_status`, the heap figures, `sockets_open`,
-  `http_sessions` and the task's `stack_free` at that moment.
+  `http_sessions`, the mesh's `adv_buf_free` / `adv_buf_idle` and the task's
+  `stack_free` at that moment.
+- `mesh` — the BLE Mesh stack's advertising buffer pool, the one resource whose
+  exhaustion makes the lights stop reacting while everything above looks fine
+  (sends fail with `-ENOBUFS`). `adv_buf_free` is the pool's own count of free
+  buffers (of `adv_buf_total`, 60); `adv_buf_idle` counts the buffers that are
+  actually unused. They agree on a healthy bridge. `adv_buf_ghosts` is the
+  difference: buffers the pool lost count of, the signature of the IDF v5.3.2
+  alloc race that `patches/0002` fixes (and of the smaller gap that remains in
+  `net_buf_unref` / `net_buf_alloc_len`); it should stay 0, and the watchdog logs
+  a warning whenever it grows. `send_errors` / `send_enobufs` / `send_err_last`
+  count model sends that completed with an error since boot. The watchdog treats
+  `adv_buf_free` at 0 as a failed check (`mesh adv pool`): the pool refills within
+  milliseconds of a send, so three such samples a minute apart are a mesh that
+  will not come back, and a restart is the cure.
 - `largest_free_block` — the largest single allocation that would fit. TLS needs
   contiguous memory, so this matters more than `free_heap` alone.
 - `wifi.reconnects` / `mqtt_connects` — Wi-Fi reconnects since boot and MQTT
@@ -440,9 +454,11 @@ Inbound (lights → HA) — the status snoop:
 >
 > **Also important:** IDF v5.3.2 has a race in the BLE Mesh advertising
 > buffer pool that makes the mesh go deaf after roughly a week of uptime
-> (sends fail with `-ENOBUFS`; HTTP, heap and Wi-Fi look fine, so the health
-> watchdog does not catch it). `patches/0002` backports Espressif's fix.
-> Apply both patches; see [`patches/README.md`](patches/README.md).
+> (sends fail with `-ENOBUFS`; HTTP, heap and Wi-Fi look fine). `patches/0002`
+> backports Espressif's fix, and since 2026-10-24 the health watchdog checks the
+> pool itself (`mesh` in `/status`), so a recurrence restarts the bridge instead
+> of leaving it deaf. Apply both patches; see
+> [`patches/README.md`](patches/README.md).
 
 ### Debugging the snoop
 

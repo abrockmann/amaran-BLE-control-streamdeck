@@ -12,6 +12,7 @@
  */
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,6 +36,7 @@
 /* Internal BLE Mesh headers — no public API exposes "self-provision with
  * pre-known keys." */
 #include "mesh/main.h"
+#include "mesh/buf.h"     /* struct net_buf_pool, for amaran_node_mesh_diag */
 #include "local.h"
 
 #include "http.h"
@@ -252,6 +254,12 @@ void amaran_mesh_access_rx(uint16_t src, uint16_t dst,
                              st.cct_kelvin, st.gm, st.hue, st.sat);
 }
 
+/* Send-completion errors, for amaran_node_mesh_diag (see http.h). Written from
+ * the mesh callback, read from the HTTP and watchdog tasks; single words. */
+static uint32_t s_send_errors;
+static uint32_t s_send_enobufs;
+static int32_t  s_send_err_last;
+
 static void custom_model_cb(esp_ble_mesh_model_cb_event_t event,
                             esp_ble_mesh_model_cb_param_t *param)
 {
@@ -266,6 +274,9 @@ static void custom_model_cb(esp_ble_mesh_model_cb_event_t event,
         break;
     case ESP_BLE_MESH_MODEL_SEND_COMP_EVT:
         if (param->model_send_comp.err_code) {
+            s_send_errors++;
+            s_send_err_last = param->model_send_comp.err_code;
+            if (param->model_send_comp.err_code == -ENOBUFS) s_send_enobufs++;
             ESP_LOGE(TAG, "model send err=%d opcode=0x%06" PRIx32,
                      param->model_send_comp.err_code,
                      param->model_send_comp.opcode);
@@ -574,6 +585,28 @@ void amaran_node_onoff_diag(amaran_onoff_diag_t *out)
     portENTER_CRITICAL(&s_onoff_mux);
     *out = s_onoff_diag;
     portEXIT_CRITICAL(&s_onoff_mux);
+}
+
+/* IDF's mesh advertising buffer pool (core/adv.c). A global, not in any public
+ * header; the pool struct comes from mesh/buf.h, already on the include path for
+ * the self-provisioning calls. Statically initialised, so safe to read before
+ * the mesh is up (it then shows a full pool). */
+extern struct net_buf_pool adv_buf_pool;
+
+void amaran_node_mesh_diag(amaran_mesh_diag_t *out)
+{
+    if (!out) return;
+    int16_t idle = 0;
+    for (int i = 0; i < adv_buf_pool.buf_count; i++) {
+        if (adv_buf_pool.__bufs[i].ref == 0) idle++;
+    }
+    out->adv_total = (int16_t)adv_buf_pool.buf_count;
+    out->adv_free = adv_buf_pool.avail_count;
+    out->adv_idle = idle;
+    out->adv_ghosts = (int16_t)(idle - adv_buf_pool.avail_count);
+    out->send_errors = s_send_errors;
+    out->send_enobufs = s_send_enobufs;
+    out->send_err_last = s_send_err_last;
 }
 
 /* Periodic poll: every POLL_INTERVAL_MS, status-request every fixture so

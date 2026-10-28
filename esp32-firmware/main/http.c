@@ -365,6 +365,7 @@ typedef struct {
     int32_t  http_status;
     uint32_t free_heap, min_free_heap, largest_block;
     int32_t  sockets_open, http_sessions;
+    int32_t  adv_free, adv_idle;    /* mesh adv pool (amaran_mesh_diag_t) */
     uint32_t stack_free;        /* watchdog task, after the failed checks */
 } health_record_t;
 RTC_NOINIT_ATTR static health_record_t s_health_rec;
@@ -385,6 +386,7 @@ static volatile bool s_image_pending;
 static int32_t s_check_err;
 static int s_check_errno;
 static int s_check_status;
+static int16_t s_mesh_ghosts_seen;   /* highest ghost count logged so far */
 
 static const char *image_check_once_locked(void)
 {
@@ -408,6 +410,24 @@ static const char *image_check_once_locked(void)
     if (err) return err;
     if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < IMAGE_CHECK_MIN_BLOCK) {
         return "heap";
+    }
+    /* The mesh (since 2026-10-24). A send with no advertising buffer left fails
+     * with -ENOBUFS and nothing above notices: HTTP answers, heap and Wi-Fi are
+     * fine, the lights just stop reacting (IDF v5.3.2's alloc race did this
+     * after about a week, see patches/0002). The pool drains and refills within
+     * milliseconds of a send, so a free count of 0 at three samples a minute
+     * apart is a pool that will not come back. Ghosts (idle buffers the pool
+     * has lost count of) are logged when they appear, so the trend is visible
+     * long before the count reaches 0. */
+    amaran_mesh_diag_t mesh;
+    amaran_node_mesh_diag(&mesh);
+    if (mesh.adv_ghosts > s_mesh_ghosts_seen) {
+        ESP_LOGW(TAG, "mesh adv pool: %d ghost buffer(s), %d free and %d idle of %d",
+                 mesh.adv_ghosts, mesh.adv_free, mesh.adv_idle, mesh.adv_total);
+        s_mesh_ghosts_seen = mesh.adv_ghosts;
+    }
+    if (mesh.adv_free <= 0) {
+        return "mesh adv pool";
     }
     return NULL;
 }
@@ -444,6 +464,10 @@ static void health_restart(const char *err)
     r->largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
     r->sockets_open = sockets_open();
     r->http_sessions = http_sessions();
+    amaran_mesh_diag_t mesh;
+    amaran_node_mesh_diag(&mesh);
+    r->adv_free = mesh.adv_free;
+    r->adv_idle = mesh.adv_idle;
     r->stack_free = uxTaskGetStackHighWaterMark(NULL);
     ESP_LOGE(TAG, "health check failed %" PRIu32 " times in a row (%s), restarting",
              s_health.fails_in_row, err);
@@ -614,6 +638,19 @@ static esp_err_t status_get(httpd_req_t *req)
     cJSON_AddNumberToObject(sock, "http_sessions", http_sessions());
     cJSON_AddNumberToObject(sock, "http_sessions_max", HTTP_MAX_SESSIONS);
 
+    /* adv_buf_free at 0 is the deaf mesh the watchdog restarts for;
+     * adv_buf_ghosts above 0 is the alloc race showing again. */
+    amaran_mesh_diag_t mesh_diag;
+    amaran_node_mesh_diag(&mesh_diag);
+    cJSON *mesh = cJSON_AddObjectToObject(root, "mesh");
+    cJSON_AddNumberToObject(mesh, "adv_buf_total", mesh_diag.adv_total);
+    cJSON_AddNumberToObject(mesh, "adv_buf_free", mesh_diag.adv_free);
+    cJSON_AddNumberToObject(mesh, "adv_buf_idle", mesh_diag.adv_idle);
+    cJSON_AddNumberToObject(mesh, "adv_buf_ghosts", mesh_diag.adv_ghosts);
+    cJSON_AddNumberToObject(mesh, "send_errors", mesh_diag.send_errors);
+    cJSON_AddNumberToObject(mesh, "send_enobufs", mesh_diag.send_enobufs);
+    cJSON_AddNumberToObject(mesh, "send_err_last", mesh_diag.send_err_last);
+
     cJSON *health = cJSON_AddObjectToObject(root, "health");
     cJSON_AddNumberToObject(health, "checks", s_health.checks);
     cJSON_AddNumberToObject(health, "fails_in_row", s_health.fails_in_row);
@@ -639,6 +676,8 @@ static esp_err_t status_get(httpd_req_t *req)
         cJSON_AddNumberToObject(last, "largest_free_block", r->largest_block);
         cJSON_AddNumberToObject(last, "sockets_open", r->sockets_open);
         cJSON_AddNumberToObject(last, "http_sessions", r->http_sessions);
+        cJSON_AddNumberToObject(last, "adv_buf_free", r->adv_free);
+        cJSON_AddNumberToObject(last, "adv_buf_idle", r->adv_idle);
         cJSON_AddNumberToObject(last, "stack_free", r->stack_free);
     }
 
